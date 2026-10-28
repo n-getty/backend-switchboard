@@ -156,6 +156,30 @@ def resolve(cfg, model):
     return cfg["alcf_url"], {"authorization": "Bearer " + tok}, True, cfg["aliases"]["alcf"].get(base, base), tag
 
 
+BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result", "thinking", "redacted_thinking",
+               "server_tool_use", "web_search_tool_result", "search_result", "container_upload"}
+
+
+def strip_client_extensions(obj):
+    """Drop Claude Code's Anthropic-only extras that Vertex-backed Argo rejects with a 400: message-level keys other
+    than role/content (e.g. output_config) and content blocks of unknown type (e.g. tool_addition).
+    Returns True if anything changed."""
+    changed = False
+    for msg in obj.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        for k in [k for k in msg if k not in ("role", "content")]:
+            del msg[k]
+            changed = True
+        content = msg.get("content")
+        if isinstance(content, list):
+            kept = [b for b in content if not isinstance(b, dict) or b.get("type") in BLOCK_TYPES]
+            if len(kept) != len(content):
+                msg["content"] = kept
+                changed = True
+    return changed
+
+
 def flatten_tool_search(obj):
     """Make Claude Code's deferred-tool search safe for backends that lack Anthropic's tool_reference blocks.
 
@@ -244,6 +268,7 @@ class Handler(BaseHTTPRequestHandler):
                 obj["model"] = up_model
                 if backend != "anthropic":
                     dirty = flatten_tool_search(obj) or dirty
+                    dirty = strip_client_extensions(obj) or dirty
                 if dirty:
                     body = json.dumps(obj).encode()
             status = self._forward(url, extra, drop_auth, body, backend)

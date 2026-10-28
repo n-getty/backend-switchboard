@@ -125,6 +125,14 @@ for tag in ("mag", "argo", "alcf"):
           and b["messages"][0]["content"][0]["content"][0]["type"] == "text"
           and "WebFetch" in b["messages"][0]["content"][0]["content"][0]["text"])
 
+ext = {"messages": [{"role": "user", "output_config": {"x": 1}, "content": [{"type": "text", "text": "hi"}, {"type": "tool_addition", "tools": ["A"]}]}]}
+_, _, _, raw_ext = post("claude-opus-5-5", extra=ext)
+check("extensions: subscription route left byte-identical", SEEN["anthropic"]["raw"] == raw_ext)
+for tag in ("mag", "argo", "alcf"):
+    post("claude-x@" + tag, extra=ext)
+    m0 = SEEN[tag]["body"]["messages"][0]
+    check("extensions stripped for @" + tag, set(m0) == {"role", "content"} and [b["type"] for b in m0["content"]] == ["text"])
+
 s, body, _, _ = post("claude-opus-5-5@google")
 check("ambiguous '@google' -> 400 with guidance", s == 400 and b"@mag" in body)
 
