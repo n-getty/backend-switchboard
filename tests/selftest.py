@@ -134,4 +134,7 @@ r = c.getresponse()
 check("argo soft error (HTTP 200 + ACCESS REVOKED) -> 429", r.status == 429)
 
 print("\n%d failure(s)" % len(fails))
-sys.exit(1 if fails else 0)
+sys.stdout.flush()
+sys.stderr.flush()
+# Python 3.8 aborts at shutdown if a daemon handler thread is still logging to stderr, so skip normal teardown.
+os._exit(1 if fails else 0)
