@@ -18,6 +18,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import backend_switchboard._router as cr  # noqa: E402
 
 SEEN = {}
+CALLS = {}      # (mock name, upstream model) -> number of requests
+REPLY = {}      # upstream model -> {"text": ..., "tool": {...}, "empty": True}; unscripted models get the plain stream
+
+
+def scripted(spec, stream):
+    """An Anthropic message (JSON or SSE) for a REPLY spec."""
+    content = []
+    if spec.get("text"):
+        content.append({"type": "text", "text": spec["text"]})
+    if spec.get("tool"):
+        content.append({"type": "tool_use", "id": "tu_1", "name": spec["tool"]["name"], "input": spec["tool"]["input"]})
+    msg = {"id": "msg_1", "type": "message", "role": "assistant", "model": "m", "content": content,
+           "stop_reason": "tool_use" if spec.get("tool") else "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}
+    if stream:
+        import backend_switchboard._asksage as _a
+        return _a.sse(msg), "text/event-stream"
+    return json.dumps(msg).encode(), "application/json"
 
 
 def mock(name):
@@ -29,6 +46,15 @@ def mock(name):
             raw = self.rfile.read(int(self.headers.get("content-length", 0)))
             body = json.loads(raw)
             SEEN[name] = {"path": self.path, "h": {k.lower(): v for k, v in self.headers.items()}, "raw": raw, "body": body}
+            CALLS[(name, body.get("model"))] = CALLS.get((name, body.get("model")), 0) + 1
+            spec = REPLY.get("__merge") if b"<draft_1>" in raw else REPLY.get(body.get("model"))
+            if spec is not None and not self.path.endswith("/query"):
+                out, ctype = scripted(spec, body.get("stream"))
+                self.send_response(200)
+                self.send_header("content-type", ctype)
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                return self.wfile.write(out)
             if body["model"] == "boom":
                 out = b'{"type":"error","error":{"type":"api_error","message":"overloaded"}}'
                 self.send_response(503)
@@ -74,6 +100,12 @@ class D1Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+        if self.path == "/judge":
+            out = json.dumps({"features": D1.get("judge", {})}).encode()
+            self.send_response(200)
+            self.send_header("content-length", str(len(out)))
+            self.end_headers()
+            return self.wfile.write(out)
         D1["calls"] += 1
         D1["texts"].append(req["text"])
         if D1["fail"]:
@@ -260,17 +292,19 @@ check("auto: a very short turn is judged together with the previous one",
       D1["texts"][-1] == "refactor the lock manager across modules\n\nyes")
 
 D1["fail"] = True
+n0 = len(log_lines(0))
 s = ask("a fresh prompt while d1 is down")
 check("auto: d1 down -> heuristic decides, request still served", s == 200 and SEEN["mag"]["body"]["model"] == "claude-small")
-check("auto: heuristic source is logged", log_lines(1)[-1]["decision"]["source"].startswith("heuristic"))
+check("auto: heuristic source is logged", log_lines(n0 + 1)[-1]["decision"]["source"].startswith("heuristic"))
 D1["fail"] = False
 cr.Handler.auto.d1.until.clear()
 
 cr.Handler.auto.c["tiers"] = {"small": ["boom@mag", "claude-small@argo"], "medium": TIERS["medium"], "large": TIERS["large"]}
+n0 = len(log_lines(0))
 s = ask("fallback prompt one")
 check("auto: 503 from the first candidate -> next candidate answers", s == 200 and SEEN["argo"]["body"]["model"] == "claude-small")
-check("auto: failed attempt is recorded", log_lines(1)[-1]["attempts"] == [["boom@mag", 503]]
-      and log_lines(1)[-1]["chosen"] == "claude-small@argo")
+last = log_lines(n0 + 1)[-1]
+check("auto: failed attempt is recorded", last["attempts"] == [["boom@mag", 503]] and last["chosen"] == "claude-small@argo")
 ask("fallback prompt two")
 ask("fallback prompt three")
 check("auto: breaker moves a failing backend to the back", cr.Handler.auto.candidates("small")[0] == "claude-small@argo")
@@ -316,6 +350,138 @@ sh = [l for l in log_lines(before + 1) if l.get("shadow")]
 check("auto shadow: explicit model untouched, decision logged", s == 200 and SEEN["anthropic"]["raw"] == raw_sh
       and sh and sh[-1]["requested"] == "claude-opus-5-5" and sh[-1]["would_use"])
 cr.Handler.auto.c["shadow"] = False
+
+
+# --- verify + escalate ------------------------------------------------------------------------------------------------
+LADDER = {"small": ["w-weak@mag"], "medium": ["w-mid@argo"], "large": ["w-strong@alcf"]}
+A = cr.Handler.auto
+A.c["tiers"] = LADDER
+READ = {"name": "Read", "input_schema": {"type": "object", "required": ["file_path"]}}
+GOOD = {"text": "Paris"}
+
+
+def run(prompt, weak, mid=GOOD, strong=GOOD, tools=None, stream=False, prior=None, extra=None):
+    REPLY.clear()
+    REPLY.update({"w-weak": weak, "w-mid": mid, "w-strong": strong})
+    CALLS.clear()
+    D1["features"] = EASY
+    msgs = list(prior or []) + [{"role": "user", "content": prompt}]
+    body = {"messages": msgs, "stream": stream}
+    if tools:
+        body["tools"] = tools
+    body.update(extra or {})
+    s, out, _, _ = post("auto", extra=body)
+    return s, out
+
+
+def calls(name):
+    return sum(n for (m, mod), n in CALLS.items() if mod == name)
+
+
+A.c["max_escalations"] = 2
+n_log = len(log_lines(0))
+s, out = run("q-refusal", {"text": "I'm sorry, but I cannot help with that. I am unable to do this."})
+check("verify: a refusal escalates and the stronger arm's answer is delivered",
+      s == 200 and b"Paris" in out and calls("w-weak") == 1 and calls("w-mid") == 1 and calls("w-strong") == 0)
+check("verify: the weak answer and its reason are logged", any(
+    l.get("attempts") and l["attempts"][0][:3] == ["w-weak@mag", 200, ["refusal"]] and l.get("escalations") == 1
+    for l in log_lines(n_log + 1)[n_log:]))
+s, out = run("q-empty", {"text": ""})
+check("verify: an empty answer escalates", s == 200 and b"Paris" in out and calls("w-mid") == 1)
+s, out = run("q-unknown-tool", {"tool": {"name": "Nope", "input": {}}}, mid={"tool": {"name": "Read", "input": {"file_path": "a"}}}, tools=[READ])
+check("verify: a call to a tool that was never offered escalates", s == 200 and b"Read" in out and calls("w-mid") == 1)
+s, out = run("q-missing-arg", {"tool": {"name": "Read", "input": {}}}, mid={"tool": {"name": "Read", "input": {"file_path": "a"}}}, tools=[READ])
+check("verify: a tool call missing a required argument escalates", s == 200 and calls("w-mid") == 1)
+loop = {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {"file_path": "a"}}]}
+res = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}
+s, out = run("q-loop", {"tool": {"name": "Read", "input": {"file_path": "a"}}}, mid={"tool": {"name": "Read", "input": {"file_path": "b"}}},
+             tools=[READ], prior=[loop, res, loop, res])
+check("verify: repeating the same tool call a third time (a loop) escalates", s == 200 and calls("w-mid") == 1)
+s, out = run("q-hedge", {"text": "I'm not sure about this. I might be wrong, but it could be Paris."})
+check("verify: repeated hedging escalates", s == 200 and calls("w-mid") == 1)
+s, out = run("q-fine", {"text": "Paris"})
+check("verify: a good answer is delivered as is, nothing escalated", s == 200 and calls("w-weak") == 1 and calls("w-mid") == 0)
+s, out = run("q-stream", {"text": "I cannot do that. I am unable to."}, stream=True)
+check("verify: works on streamed answers and delivers the escalated stream", s == 200 and out.lstrip().startswith(b"event:") and b"Paris" in out)
+
+s, out = run("q-pin", {"text": "I cannot do that. I am unable to."})
+w0 = calls("w-weak")
+REPLY.update({"w-weak": {"text": "I cannot do that. I am unable to."}, "w-mid": GOOD})
+CALLS.clear()
+post("auto", extra={"messages": [{"role": "user", "content": "q-pin"}]})
+check("verify: after escalating, the rest of that user turn starts at the stronger arm (pinned)",
+      w0 == 1 and calls("w-weak") == 0 and calls("w-mid") == 1)
+
+A.c["max_escalations"] = 1
+refuse = {"text": "I cannot do that. I am unable to."}
+s, out = run("q-capped", refuse, mid=refuse)
+check("verify: escalation is capped; the last answer is delivered rather than looping", s == 200 and calls("w-strong") == 0 and calls("w-mid") == 1)
+A.c["max_escalations"] = 2
+s, out = run("q-soft-cap", refuse, mid=refuse)
+check("verify: if the stronger arm also says it cannot, stop (a real limit, not a weak model)",
+      s == 200 and calls("w-weak") == 1 and calls("w-mid") == 1 and calls("w-strong") == 0)
+s, out = run("q-hard-continues", {"text": ""}, mid={"text": ""})
+check("verify: hard failures keep escalating past the first step", s == 200 and calls("w-strong") == 1 and b"Paris" in out)
+A.c["verify"] = False
+s, out = run("q-noverify", refuse)
+check("verify: can be switched off", s == 200 and calls("w-mid") == 0 and b"cannot" in out)
+A.c["verify"] = True
+
+A.c["judge"] = {"enabled": True, "min_correct": 0.5, "max_refuses": 0.5}
+D1["judge"] = {"correct": 0.2, "refuses": 0.0}
+s, out = run("q-judge", {"text": "A confident but wrong answer."})
+check("verify: a low d1 judge score escalates", s == 200 and calls("w-mid") == 1)
+D1["judge"] = {"correct": 0.9, "refuses": 0.0}
+s, out = run("q-judge-ok", {"text": "A confident right answer."})
+check("verify: a high d1 judge score accepts", s == 200 and calls("w-mid") == 0)
+A.c["judge"] = {"enabled": False}
+
+part = auto_mod_cfg = cr.auto_mod.auto_config({"auto": {"synthesis": {"enabled": True}, "judge": {"enabled": True}}})
+check("config: a partial nested option keeps the other defaults",
+      part["synthesis"]["enabled"] and part["synthesis"]["merger"] == "muse" and part["judge"]["min_correct"] == 0.5)
+
+# --- synthesis ---------------------------------------------------------------------------------------------------------
+A.c["tiers"], A.c["enabled_arms"] = {}, ["muse", "beam", "sonnet"]
+A.c["synthesis"] = dict(A.c["synthesis"], enabled=True, min_need=0.0, agree_above=0.6)
+BEAM, MUSE = "beam-1.0-bf16", "muse-spark-bf16"
+
+
+def synth(beam, muse, merged=None, prior=None, tools=None):
+    REPLY.clear()
+    REPLY.update({BEAM: beam, MUSE: muse})
+    if merged:
+        REPLY["__merge"] = merged
+    CALLS.clear()
+    D1["features"] = dict(EASY, **{"domain=chat": 1.0})
+    body = {"messages": list(prior or []) + [{"role": "user", "content": "unique %s" % time.time()}]}
+    if tools:
+        body["tools"] = tools
+    s, out, _, _ = post("auto", extra=body)
+    return s, out
+
+
+s, out = synth({"text": "The capital of France is Paris."}, {"text": "The capital of France is Paris."})
+check("synthesis: two agreeing prose drafts -> one is delivered, no merge call", s == 200 and calls(BEAM) + calls(MUSE) == 2)
+s, out = synth({"text": "The answer is alpha because of reason one."}, {"text": "Probably omega, owing to something else entirely."},
+               merged={"text": "MERGED FINAL"})
+check("synthesis: differing prose drafts are merged by the merger arm", s == 200 and b"MERGED FINAL" in out and calls(MUSE) == 2 and calls(BEAM) == 1)
+mb = SEEN["alcf"]["body"]
+check("synthesis: the merge request has no tools and carries both drafts",
+      "tools" not in mb and "<draft_1>" in json.dumps(mb) and "alpha" in json.dumps(mb) and "omega" in json.dumps(mb))
+s, out = synth({"tool": {"name": "Read", "input": {"file_path": "a"}}}, {"text": "I would just answer directly."}, tools=[READ])
+check("synthesis: a tool call is never merged; the tool-calling draft is chosen", s == 200 and b"Read" in out and calls(BEAM) + calls(MUSE) == 2)
+s, out = synth({"text": ""}, {"text": "Muse answers alone."})
+check("synthesis: if one draft is unusable the other is delivered", s == 200 and b"Muse answers alone." in out)
+tr = [{"role": "user", "content": "do it"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Read", "input": {"file_path": "a"}}]},
+      {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}]
+REPLY.clear()
+REPLY.update({BEAM: GOOD, MUSE: GOOD})
+CALLS.clear()
+post("auto", extra={"messages": tr, "tools": [READ]})
+check("synthesis: tool-result continuations are not fanned out", calls(BEAM) + calls(MUSE) == 1)
+A.c["synthesis"] = dict(A.c["synthesis"], enabled=False)
+A.c["enabled_arms"], A.c["tiers"] = None, TIERS
+REPLY.clear()
 
 print("\n%d failure(s)" % len(fails))
 sys.stdout.flush()

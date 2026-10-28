@@ -24,11 +24,13 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from . import _asksage as asksage
 from . import _auto as auto_mod
+from . import _verify as verify
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("BACKEND_SWITCHBOARD_HOME", os.path.join(HOME, ".backend-switchboard"))
@@ -217,12 +219,70 @@ def flatten_tool_search(obj):
     return changed
 
 
-class Retryable(Exception):
-    """A backend failed before sending anything to the client; `auto` may try the next candidate."""
+class Result:
+    """A buffered upstream answer, held back until `auto` has checked it."""
 
-    def __init__(self, status, backend):
-        Exception.__init__(self, "retryable %s from %s" % (status, backend))
-        self.status, self.backend = status, backend
+    def __init__(self, status, headers, body, backend):
+        self.status, self.headers, self.body, self.backend = status, headers, body, backend
+
+    @property
+    def ctype(self):
+        return next((v for k, v in self.headers if k.lower() == "content-type"), "")
+
+
+class Capture:
+    """Stands in for the HTTP handler so a backend that writes its own response (AskSage) can be buffered."""
+
+    def __init__(self, h):
+        self.path, self.command, self.headers = h.path, h.command, h.headers
+        self.status, self.headers_out, self.close_connection, self.body = 200, [], False, bytearray()
+        self.wfile = self
+
+    def send_response(self, status, reason=None):
+        self.status = status
+
+    def send_header(self, k, v):
+        self.headers_out.append((k, v))
+
+    def end_headers(self):
+        pass
+
+    def write(self, b):
+        self.body += b
+
+    def flush(self):
+        pass
+
+
+def _error_body(status, message):
+    return json.dumps({"type": "error", "error": {"type": "invalid_request_error" if status < 500 else "api_error",
+                                                   "message": message}}).encode()
+
+
+SYNTH_PROMPT = ("Two independent drafts answer the request above. Write the single best final answer to it. Keep what "
+                "the drafts agree on; where they disagree, work out which is right; fix any mistakes. Do not mention "
+                "the drafts or that you were given them.\n\n<draft_1>\n%s\n</draft_1>\n\n<draft_2>\n%s\n</draft_2>")
+
+
+def last_turn_is_typed(obj):
+    """True if the newest message is something the user typed (not just tool results returning to the model)."""
+    msgs = obj.get("messages") or []
+    if not msgs or not isinstance(msgs[-1], dict) or msgs[-1].get("role") != "user":
+        return False
+    c = msgs[-1].get("content")
+    return isinstance(c, str) or (isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "text" for b in c))
+
+
+def synth_request(obj, drafts):
+    """The original request with no tools and both drafts appended to the user's last message."""
+    o = json.loads(json.dumps(obj))
+    o.pop("tools", None)
+    o.pop("tool_choice", None)
+    last = o["messages"][-1]
+    blocks = [{"type": "text", "text": last["content"]}] if isinstance(last["content"], str) else last["content"]
+    blocks.append({"type": "text", "text": SYNTH_PROMPT % tuple(drafts)})
+    last["content"] = blocks
+    return o
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -233,8 +293,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _err(self, status, message):
-        body = json.dumps({"type": "error", "error": {"type": "invalid_request_error" if status < 500 else "api_error",
-                                                       "message": message}}).encode()
+        body = _error_body(status, message)
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -268,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(401, "missing or wrong x-router-key")
         n = int(self.headers.get("content-length") or 0)
         raw = self.rfile.read(n) if n else b""
-        model, backend, plan, chosen, attempts = "-", "?", None, None, []
+        model, backend, plan, chosen, attempts, info = "-", "?", None, None, [], {}
         try:
             obj = None
             if raw and self.path.split("?")[0].startswith("/v1/messages"):
@@ -286,31 +345,21 @@ class Handler(BaseHTTPRequestHandler):
                                               "auto.enabled_arms in %s/config.json)" % DIR)
                 elif self.auto.c["shadow"]:
                     self.auto.shadow(obj, model, len(raw))
-            candidates = plan.candidates if plan else [model]
-            for i, cand in enumerate(candidates):
-                last = i == len(candidates) - 1
-                try:
-                    # obj is mutated by each attempt, so later attempts start from the original bytes
-                    status, backend = self._route_once(raw, obj if i == 0 else json.loads(raw), cand,
-                                                       retry_ok=plan is not None and not last)
-                    chosen = cand
-                    if plan:
-                        (self.auto.backends.fail if status in auto_mod.RETRYABLE else self.auto.backends.success)(cand)
-                    break
-                except Retryable as r:
-                    self.auto.backends.fail(cand)
-                    attempts.append([cand, r.status])
-                    status, backend = r.status, r.backend
-                except RouteError as e:
-                    if plan is None or last:
-                        raise
-                    attempts.append([cand, e.status])
+            if plan is None:
+                chosen = model
+                status, backend = self._route_once(raw, obj, model)
+            else:
+                res, chosen = self._run_auto(raw, obj, plan, attempts, info)
+                self._deliver(res)
+                status, backend = res.status, res.backend
         except RouteError as e:
             status = e.status
             self._err(e.status, e.message)
         except Exception as e:
             status = 502 if isinstance(e, (OSError, http.client.HTTPException)) else 500
             sys.stderr.write("router error: %r\n" % (e,))
+            if os.environ.get("BACKEND_SWITCHBOARD_DEBUG"):
+                traceback.print_exc()
             try:
                 self._err(status, "router/upstream error: %s" % e)
             except OSError:
@@ -318,32 +367,36 @@ class Handler(BaseHTTPRequestHandler):
         label = "%s>%s" % (model, chosen) if plan else model
         if plan:
             self.auto.record(requested=model, tier=plan.tier, decision=plan.decision, attempts=attempts,
-                             chosen=chosen, backend=backend, status=status, total_ms=round((time.time() - t0) * 1000))
+                             chosen=chosen, backend=backend, status=status, total_ms=round((time.time() - t0) * 1000),
+                             **info)
         sys.stderr.write("%s %-40s -> %s %s %.2fs\n" % (time.strftime("%H:%M:%S"), label[:40],
                          backend, status, time.time() - t0))
         sys.stderr.flush()
 
-    def _route_once(self, raw, obj, model, retry_ok):
-        """Resolve `model` to a backend, rewrite the request for it and forward. Returns (status, backend)."""
+    # --- one candidate ----------------------------------------------------------------------------------------------
+    def _prepare(self, raw, obj, model):
+        """Resolve `model` and rewrite the request for it -> (url, extra, drop_auth, body, backend, obj)."""
         body = raw
         if model == "-":
-            url, extra, drop_auth, up_model, backend = self.cfg["anthropic_url"], {}, False, None, "anthropic"
-        else:
-            url, extra, drop_auth, up_model, backend = resolve(self.cfg, model)
-            dirty = up_model != obj["model"]
-            obj["model"] = up_model
-            if backend != "anthropic":
-                dirty = flatten_tool_search(obj) or dirty
-                dirty = strip_client_extensions(obj) or dirty
-            if dirty:
-                body = json.dumps(obj).encode()
+            return self.cfg["anthropic_url"], {}, False, body, "anthropic", obj
+        url, extra, drop_auth, up_model, backend = resolve(self.cfg, model)
+        dirty = up_model != obj["model"]
+        obj["model"] = up_model
+        if backend != "anthropic":
+            dirty = flatten_tool_search(obj) or dirty
+            dirty = strip_client_extensions(obj) or dirty
+        if dirty:
+            body = json.dumps(obj).encode()
+        return url, extra, drop_auth, body, backend, obj
+
+    def _route_once(self, raw, obj, model):
+        """Forward to `model`, streaming the answer straight to the client. Returns (status, backend)."""
+        url, extra, drop_auth, body, backend, obj = self._prepare(raw, obj, model)
         if backend == "asksage":
             return asksage.handle(self, self.cfg, obj), backend
-        return self._forward(url, extra, drop_auth, body, backend, retry_ok), backend
+        return self._forward(url, extra, drop_auth, body, backend), backend
 
-    def _forward(self, url, extra, drop_auth, body, backend, retry_ok=False):
-        """Forward one request and stream the answer back. With retry_ok, a retryable failure that happens before
-        any byte reaches the client raises Retryable instead, so the caller can try another backend."""
+    def _upstream(self, url, extra, drop_auth, backend, strip_encoding=False):
         u = urlsplit(url)
         headers = {}
         for k, v in self.headers.items():
@@ -352,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if drop_auth and lk in ("authorization", "x-api-key"):
                 continue
-            if backend == "argo" and lk == "accept-encoding":
+            if lk == "accept-encoding" and (backend == "argo" or strip_encoding):
                 continue
             headers[lk] = v
         headers.update(extra)
@@ -360,25 +413,16 @@ class Handler(BaseHTTPRequestHandler):
             conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=900, context=ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
-        try:
-            conn.request(self.command, u.path.rstrip("/") + self.path, body or None, headers)
-            resp = conn.getresponse()
-        except (OSError, http.client.HTTPException):
-            conn.close()
-            if retry_ok:
-                raise Retryable(502, backend)
-            raise
-        if retry_ok and resp.status in auto_mod.RETRYABLE:
-            resp.read()
-            conn.close()
-            raise Retryable(resp.status, backend)
+        return conn, u.path.rstrip("/") + self.path, headers
+
+    def _forward(self, url, extra, drop_auth, body, backend):
+        conn, path, headers = self._upstream(url, extra, drop_auth, backend)
+        conn.request(self.command, path, body or None, headers)
+        resp = conn.getresponse()
         first = b""
         if backend == "argo" and resp.status == 200:
             first = resp.read1(8192)
             if any(s in first[:4000] for s in SOFT_ERRORS):
-                if retry_ok:
-                    conn.close()
-                    raise Retryable(429, backend)
                 self._err(429, "Argo returned a usage/quota notice (HTTP 200 soft error): " + first[:300].decode("utf8", "replace"))
                 conn.close()
                 return 429
@@ -400,6 +444,175 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         conn.close()
         return resp.status
+
+    def _fetch(self, raw, obj, model):
+        """Like _route_once, but hold the whole answer back and return it as a Result. Raises RouteError."""
+        url, extra, drop_auth, body, backend, obj = self._prepare(raw, obj, model)
+        if backend == "asksage":
+            cap = Capture(self)
+            asksage.handle(cap, self.cfg, obj)
+            return Result(cap.status, cap.headers_out, bytes(cap.body), backend)
+        conn, path, headers = self._upstream(url, extra, drop_auth, backend, strip_encoding=True)
+        try:
+            conn.request(self.command, path, body or None, headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            res = Result(resp.status, resp.getheaders(), data, backend)
+        except (OSError, http.client.HTTPException) as e:
+            return Result(502, [("content-type", "application/json")],
+                          _error_body(502, "%s unreachable: %s" % (backend, e)), backend)
+        finally:
+            conn.close()
+        if backend == "argo" and res.status == 200 and any(s in data[:4000] for s in SOFT_ERRORS):
+            return Result(429, [("content-type", "application/json")],
+                          _error_body(429, "Argo returned a usage/quota notice (HTTP 200 soft error): "
+                                      + data[:300].decode("utf8", "replace")), backend)
+        return res
+
+    def _deliver(self, res):
+        self.send_response(res.status)
+        for k, v in res.headers:
+            if k.lower() not in HOP:
+                self.send_header(k, v)
+        self.send_header("content-length", str(len(res.body)))
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.write(res.body)
+        self.close_connection = True
+
+    # --- auto: fetch, check, escalate -------------------------------------------------------------------------------
+    def _issues(self, res, obj, text):
+        """What is wrong with an answer, as (code, severity, detail) tuples; [] when it is fine."""
+        msg = verify.parse(res.body, res.ctype)
+        issues = verify.check(msg, obj)
+        if not issues and msg and msg["text"].strip() and not msg["tool_uses"]:
+            j = self.auto.judge(text, msg["text"])
+            lim = self.auto.c["judge"]
+            if j.get("correct") is not None and j["correct"] < lim["min_correct"]:
+                issues.append(("judge_low", "soft", "judge P(correct)=%.2f" % j["correct"]))
+            if j.get("refuses") is not None and j["refuses"] > lim["max_refuses"]:
+                issues.append(("judge_refuses", "soft", "judge P(refuses)=%.2f" % j["refuses"]))
+        return issues
+
+    def _run_auto(self, raw, obj, plan, attempts, info):
+        """Try the planned arms in order. Each 200 answer is checked; a weak one escalates to a stronger arm, an error
+        moves down the fallback chain. Returns (Result, model that produced it)."""
+        a, c = self.auto, self.auto.c
+        syn = c["synthesis"]
+        if syn["enabled"] and plan.ranked:
+            out = self._synthesize(raw, obj, plan, attempts, info)
+            if out:
+                return out
+        text = auto_mod.routing_text(obj)
+        tried, escalations, fallback, last_err = [], 0, None, None
+        cand = plan.candidates[0]
+        while cand is not None:
+            tried.append(cand)
+            try:
+                r = self._fetch(raw, json.loads(raw), cand)
+            except RouteError as e:
+                attempts.append([cand, e.status])
+                last_err, cand = e, a.next_candidate(plan, tried, cand, False)
+                continue
+            if r.status in auto_mod.RETRYABLE:
+                a.backends.fail(cand)
+                attempts.append([cand, r.status])
+                fallback = fallback or r
+                cand = a.next_candidate(plan, tried, cand, False)
+                continue
+            a.backends.success(cand)
+            if r.status != 200 or not c["verify"]:
+                return r, cand
+            try:
+                issues = self._issues(r, obj, text)
+            except Exception as e:  # the checker must never break a request: accept what we got
+                sys.stderr.write("verify error: %r\n" % (e,))
+                issues = []
+            if not issues:
+                if escalations:
+                    a.pin(plan, cand)
+                return r, cand
+            attempts.append([cand, r.status, [i[0] for i in issues]])
+            fallback = r
+            if escalations and all(i[1] == "soft" for i in issues):
+                # A stronger arm also says it can't / isn't sure: that is evidence the limit is real, not the model's.
+                return r, cand
+            nxt = a.next_candidate(plan, tried, cand, True) if escalations < c["max_escalations"] else None
+            if nxt is None:
+                return r, cand
+            escalations += 1
+            info["escalations"] = escalations
+            cand = nxt
+        if fallback is not None:
+            return fallback, tried[-1]
+        raise last_err or RouteError(502, "no backend could answer")
+
+    def _synthesize(self, raw, obj, plan, attempts, info):
+        """Ask two arms in parallel and combine. Returns (Result, model) or None to fall back to the normal path.
+
+        Only on a fresh user turn and when the planner's first choice is one of the synthesis arms (the cheap pool is
+        judged good enough). If either draft makes a tool call there is nothing to merge (a tool call has side effects
+        and cannot be averaged), so one draft is chosen; if both are prose and agree, the better-placed arm's draft is
+        used; if they differ, a merger call writes the final answer."""
+        syn, a = self.auto.c["synthesis"], self.auto
+        arms = auto_mod._arms.registry(a.c)
+        models = [arms[n]["model"] for n in syn["arms"] if n in arms and arms[n]["model"] in plan.candidates]
+        if (len(models) < 2 or plan.candidates[0] not in models or plan.need < syn["min_need"]
+                or not last_turn_is_typed(obj)):
+            return None
+        results = {}
+
+        def run(m):
+            try:
+                results[m] = self._fetch(raw, json.loads(raw), m)
+            except RouteError as e:
+                results[m] = Result(e.status, [], _error_body(e.status, e.message), "?")
+        threads = [threading.Thread(target=run, args=(m,)) for m in models[:2]]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        p_of = {r["model"]: r["p"] for r in plan.ranked}
+        text, good = auto_mod.routing_text(obj), []
+        for m in models[:2]:
+            r = results[m]
+            msg = verify.parse(r.body, r.ctype) if r.status == 200 else None
+            hard = [i for i in verify.check(msg, obj) if i[1] == "hard"] if msg else [("unparsed", "hard", "")]
+            attempts.append([m, r.status, "draft"] + [i[0] for i in hard])
+            (a.backends.success if r.status not in auto_mod.RETRYABLE else a.backends.fail)(m)
+            if r.status == 200 and not hard:
+                good.append((m, r, msg))
+        info["synthesis"] = len(good)
+        if len(good) < 2:
+            if not good:
+                return None
+            info["synthesis"] = "single"
+            return good[0][1], good[0][0]
+        good.sort(key=lambda g: -p_of.get(g[0], 0.0))
+        (m1, r1, g1), (m2, r2, g2) = good
+        if g1["tool_uses"] or g2["tool_uses"]:
+            pick = next(g for g in good if g[2]["tool_uses"])   # a tool call can't be merged; take the better-placed one
+            info["synthesis"] = "tool_turn"
+            return pick[1], pick[0]
+        sim = verify.similarity(g1["text"], g2["text"])
+        info["agreement"] = round(sim, 2)
+        if sim >= syn["agree_above"]:
+            info["synthesis"] = "agree"
+            return r1, m1
+        arbiter = arms.get(syn.get("arbiter") or "")
+        merger = arbiter["model"] if arbiter and sim < syn["agree_above"] / 2 else arms[syn["merger"]]["model"]
+        o2 = synth_request(obj, [g1["text"], g2["text"]])
+        try:
+            r3 = self._fetch(json.dumps(o2).encode(), o2, merger)
+        except RouteError:
+            r3 = None
+        if r3 is not None and r3.status == 200 and not [i for i in verify.check(verify.parse(r3.body, r3.ctype), o2)
+                                                        if i[1] == "hard"]:
+            info["synthesis"] = "merged"
+            info["merger"] = merger
+            return r3, merger
+        info["synthesis"] = "merge_failed"
+        return r1, m1
 
 
 def build_server(cfg):

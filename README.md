@@ -123,6 +123,24 @@ Tiers hold ordinary model names, so every tag, alias and credential rule above a
   cross-family gaps are uncertain (`unc`, subtracted as a penalty). Override or add arms under `auto.arms`, restrict
   them with `auto.enabled_arms`, and scale a pool's scarcity with `auto.pool_scale` (Argo defaults to 3x list price
   because its monthly cap is finite). `decide "prompt" --tools Bash Edit` prints the ranking.
+- **Verify and escalate (`auto.verify`, on by default).** Every `auto` answer is held back, checked, and only then sent
+  to Claude Code (so `auto` answers arrive whole rather than streaming; explicit model names still stream). Checks that
+  always escalate: an empty answer, a call to a tool the request never offered, tool arguments that are not an object
+  or miss a required key, and the same tool call repeated a third time (a loop). Checks that escalate once: the model
+  says it cannot do the task, or hedges repeatedly. If a stronger arm *also* says it cannot, the router stops and
+  delivers that answer: two independent models agreeing is evidence the limit is real, not the model's. The next arm is
+  the cheapest untried one with a higher chance of success than the one that just failed (`max_escalations`, default
+  2), and after an escalation the stronger arm is kept for the rest of that user turn (`pin_ttl`), so an agent loop does
+  not re-try the weak arm on every step. Errors (429/5xx/unreachable) move down the fallback chain instead. The checker
+  fails open: if it throws, the answer is delivered. An optional d1 judge (`auto.judge.enabled`, needs the d1
+  service's `/judge`) adds a P(correct) / P(refuses) check; it is off until its accuracy has been measured.
+- **Synthesis (`auto.synthesis.enabled`, off by default).** On a fresh user turn, when the planner's first choice is one
+  of `synthesis.arms` (default Muse and Beam, both free), both are asked in parallel. If either draft makes a tool call
+  nothing is merged (a tool call has side effects and cannot be averaged): the better-placed arm's call is used. If both
+  are prose and agree (word overlap above `agree_above`), one is delivered. If they differ, `merger` writes the final
+  answer from both drafts (`arbiter`, e.g. a paid arm, takes over when they differ a lot). An unusable draft falls back
+  to the other. Cost: twice the load on those arms and a longer wait (two reasoning-heavy drafts, then the merge; a
+  disagreement took 44 s in one live run), so use it where quality matters more than latency.
 - **What d1 reads.** The latest typed user turn, not tool results or Claude Code's injected reminders. A very short
   turn ("yes", "continue") is judged together with the previous one. The decision is cached per prompt, so the many
   requests of one agent loop cost one d1 call.
@@ -142,7 +160,9 @@ Tiers hold ordinary model names, so every tag, alias and credential rule above a
   measure the router before trusting it.
 - **Try it without sending anything:** `backend-switchboard decide "prove the lemma"` prints the tier and candidate chain.
 
-Not done yet: quota-aware routing (needs per-backend usage accounting) and capability filters (vision, context size).
+Not done yet: quota-aware routing (needs per-backend usage accounting). Muse's default `xhigh` reasoning can use up a small
+`max_tokens` before it writes any text (the checker sees that as an empty answer); Claude Code's normal budgets are large
+enough, but short test requests may need more.
 
 ## Tool search
 
@@ -169,6 +189,8 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
 | `aliases` | `beam`, `muse` | short names per backend |
 | `auto` | unset | enables `/model auto`; see [Auto routing](#auto-routing-model-auto) |
+
+Set `BACKEND_SWITCHBOARD_DEBUG=1` to print tracebacks for router errors.
 
 ## Security
 

@@ -43,6 +43,13 @@ DEFAULTS = {
     "unc_weight": 1.0,         # how much to distrust weakly-evidenced skills
     "est_output_tokens": 1500,
     "pool_scale": {},          # per-pool scarcity multiplier on list price, e.g. {"argo": 2.0}
+    "verify": True,            # buffer each auto answer, check it, and escalate a weak one to a stronger arm
+    "max_escalations": 2,
+    "pin_ttl": 600,            # after an escalation, keep the stronger arm for the rest of that user turn (seconds)
+    "judge": {"enabled": False, "min_correct": 0.5, "max_refuses": 0.5},   # d1 /judge as an extra verifier
+    # Ask two arms in parallel and merge their answers. Off by default: it doubles load on the arms involved.
+    "synthesis": {"enabled": False, "arms": ["muse", "beam"], "merger": "muse", "min_need": 0.35,
+                  "agree_above": 0.6, "arbiter": None},
     "floor": "small",
     "ceiling": "large",
     "weights": {"expert": 3.752659678844416, "difficulty": 2.2941577300354083},
@@ -55,13 +62,17 @@ DEFAULTS = {
     "breaker_cooldown": 60,
 }
 
+NESTED = ("judge", "synthesis")
 MAX_CHARS = 16000
 SHORT_TURN = 80
 
 
 def auto_config(cfg):
+    """DEFAULTS overlaid with config["auto"]; the nested option dicts merge key by key, so a partial
+    "synthesis": {"enabled": true} keeps the other defaults."""
     out = dict(DEFAULTS)
-    out.update(cfg.get("auto") or {})
+    for k, v in (cfg.get("auto") or {}).items():
+        out[k] = dict(out[k], **v) if isinstance(out.get(k), dict) and isinstance(v, dict) and k in NESTED else v
     return out
 
 
@@ -142,8 +153,10 @@ def heuristic_features(text, tier):
 
 
 class Plan:
-    def __init__(self, tier, candidates, decision):
+    def __init__(self, tier, candidates, decision, ranked=None):
         self.tier, self.candidates, self.decision = tier, candidates, decision
+        self.ranked = ranked or []       # arms mode: every eligible arm with its P(success) and cost
+        self.need = decision.get("need", 0.0)
 
 
 class Auto:
@@ -151,7 +164,7 @@ class Auto:
         self.backends_available = set(backends)
         self.c = auto_config(cfg)
         self.log_path = os.path.join(home, "auto.jsonl")
-        self.cache, self.lock = {}, threading.Lock()
+        self.cache, self.pins, self.lock = {}, {}, threading.Lock()
         self.backends = Breaker(self.c["breaker_failures"], self.c["breaker_cooldown"])
         self.d1 = Breaker(3, 30)  # d1 itself: after 3 failures stop paying its timeout on every request
 
@@ -258,13 +271,70 @@ class Auto:
         text = routing_text(obj)
         if any(self.c["tiers"].get(t) for t in TIERS):
             d = self.decide(text)
-            return Plan(d["tier"], self.candidates(d["tier"]), d)
+            return Plan(d["tier"], self._pinned_first(d["prompt_sha1"], self.candidates(d["tier"])), d)
         d, ranked = self.arms(obj, text, nbytes)
         if not ranked:
             return None
         models = [r["model"] for r in ranked]
         healthy = [m for m in models if self.backends.ok(m)]
-        return Plan(ranked[0]["arm"], healthy + [m for m in models if m not in healthy], d)
+        order = self._pinned_first(d["prompt_sha1"], healthy + [m for m in models if m not in healthy])
+        return Plan(ranked[0]["arm"], order, d, ranked)
+
+    # --- escalation -----------------------------------------------------------------------------------------------
+    def _pinned_first(self, sha, order):
+        with self.lock:
+            hit = self.pins.get(sha)
+        if hit and time.time() < hit[1] and hit[0] in order:
+            return [hit[0]] + [m for m in order if m != hit[0]]
+        return order
+
+    def pin(self, plan, model):
+        """Keep `model` for the rest of this user turn: the next requests of the same agent loop skip the weak arms."""
+        with self.lock:
+            if len(self.pins) > 512:
+                self.pins.clear()
+            self.pins[plan.decision["prompt_sha1"]] = (model, time.time() + self.c["pin_ttl"])
+
+    def next_candidate(self, plan, tried, failed, hard_failure):
+        """Pick the arm to try after `failed` gave a weak answer (or an error: hard_failure=False).
+
+        An error moves down the fallback chain. A weak answer must go to something stronger: the cheapest untried arm
+        with a higher chance of success than the one that just failed (arms mode), or the next candidate up the ladder
+        (tiers mode). Returns a router model name, or None when nothing stronger is left."""
+        untried = [m for m in plan.candidates if m not in tried]
+        if not untried:
+            return None
+        if not hard_failure or not plan.ranked:
+            return untried[0]
+        p_of = {r["model"]: r["p"] for r in plan.ranked}
+        base = p_of.get(failed, 0.0)
+        stronger = [r for r in plan.ranked if r["model"] in untried and r["p"] > base + 0.02]
+        if not stronger:
+            return None
+        return min(stronger, key=lambda r: (r["cost"], -r["p"]))["model"]
+
+    # --- optional d1 judge ----------------------------------------------------------------------------------------
+    def judge(self, request_text, response_text):
+        """P(correct)/P(refuses) for an answer from the d1 service's /judge endpoint, or {} if unavailable."""
+        j = self.c["judge"]
+        if not (j.get("enabled") and self.c["d1_url"]) or not self.d1.ok("judge"):
+            return {}
+        u = urlsplit(self.c["d1_url"])
+        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=self.c["d1_timeout"] * 2)
+        try:
+            conn.request("POST", "/judge", json.dumps({"request": request_text, "response": response_text}),
+                         {"content-type": "application/json"})
+            r = conn.getresponse()
+            body = r.read()
+            if r.status != 200:
+                raise RuntimeError("judge HTTP %d" % r.status)
+            self.d1.success("judge")
+            return json.loads(body)["features"]
+        except Exception:
+            self.d1.fail("judge")
+            return {}
+        finally:
+            conn.close()
 
     # --- telemetry ------------------------------------------------------------------------------------------------
     def record(self, **fields):
