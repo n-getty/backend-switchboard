@@ -485,9 +485,9 @@ class Handler(BaseHTTPRequestHandler):
         """What is wrong with an answer, as (code, severity, detail) tuples; [] when it is fine."""
         msg = verify.parse(res.body, res.ctype)
         issues = verify.check(msg, obj)
-        if not issues and msg and msg["text"].strip() and not msg["tool_uses"]:
+        lim = self.auto.c["judge"]
+        if not issues and msg and msg["text"].strip() and not msg["tool_uses"] and len(msg["text"]) <= lim.get("max_chars", 2000):
             j = self.auto.judge(text, msg["text"])
-            lim = self.auto.c["judge"]
             if j.get("correct") is not None and j["correct"] < lim["min_correct"]:
                 issues.append(("judge_low", "soft", "judge P(correct)=%.2f" % j["correct"]))
             if j.get("refuses") is not None and j["refuses"] > lim["max_refuses"]:

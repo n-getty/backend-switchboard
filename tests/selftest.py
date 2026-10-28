@@ -434,6 +434,9 @@ check("verify: a low d1 judge score escalates", s == 200 and calls("w-mid") == 1
 D1["judge"] = {"correct": 0.9, "refuses": 0.0}
 s, out = run("q-judge-ok", {"text": "A confident right answer."})
 check("verify: a high d1 judge score accepts", s == 200 and calls("w-mid") == 0)
+D1["judge"] = {"correct": 0.1, "refuses": 0.0}
+s, out = run("q-judge-long", {"text": "A long answer. " * 400})
+check("verify: the judge is skipped on long answers, where it is no better than chance", s == 200 and calls("w-mid") == 0)
 A.c["judge"] = {"enabled": False}
 
 part = auto_mod_cfg = cr.auto_mod.auto_config({"auto": {"synthesis": {"enabled": True}, "judge": {"enabled": True}}})

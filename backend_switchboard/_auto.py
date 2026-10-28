@@ -46,7 +46,7 @@ DEFAULTS = {
     "verify": True,            # buffer each auto answer, check it, and escalate a weak one to a stronger arm
     "max_escalations": 2,
     "pin_ttl": 600,            # after an escalation, keep the stronger arm for the rest of that user turn (seconds)
-    "judge": {"enabled": False, "min_correct": 0.5, "max_refuses": 0.5},   # d1 /judge as an extra verifier
+    "judge": {"enabled": False, "min_correct": 0.5, "max_refuses": 0.5, "max_chars": 2000},   # d1 /judge: AUROC ~0.76, ~chance on long answers   # d1 /judge as an extra verifier
     # Ask two arms in parallel and merge their answers. Off by default: it doubles load on the arms involved.
     "synthesis": {"enabled": False, "arms": ["muse", "beam"], "merger": "muse", "min_need": 0.35,
                   "agree_above": 0.6, "arbiter": None},
