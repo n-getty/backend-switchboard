@@ -72,14 +72,23 @@ ALCF's Minerva endpoint accepts the Anthropic Messages API directly with a Beare
 are, including streaming, tool calls and the models' thinking blocks. Aliases `beam` and `muse` map to `beam-1.0-bf16`
 and `muse-spark-bf16`; any other name is passed through. Add or change aliases under `aliases.alcf` in `config.json`.
 
-**AskSage (`@asksage`).** Export `ASKSAGE_API_KEY` in the environment the router starts from (it is read per request and
-never logged). The model name is AskSage's own id, e.g. `/model google-claude-opus-5@asksage` or `gpt-4.1@asksage`. If your
-AskSage host needs an extra CA certificate, set `asksage_cert`; `asksage_url` defaults to `https://api.asksage.anl.gov/server`.
-The router translates Anthropic requests to AskSage's `/query` itself (no asksage-proxy, no llm-rosetta): the history goes
-over as `me`/`gpt` turns, `tools` as a JSON list, and since AskSage has no field for tool results, earlier tool calls and
-their results are written into the history as prose. Answers arrive whole, so streaming is emulated. Claude models on AskSage
-handle the full tool loop (Read, ToolSearch, Bash); weaker ones (`gpt-4.1`) often stall on deferred tools. Token counts are
-estimates, and some AskSage models report `model_error` while the upstream is down.
+**AskSage (`@asksage`).** Setup:
+
+1. Get an AskSage API key from your AskSage account settings (for ANL: https://api.asksage.anl.gov) and export it in the
+   shell that starts the router, e.g. in `~/.bashrc`: `export ASKSAGE_API_KEY=...`. The router reads it per request and
+   never logs it. It reads only the environment, so restart the router after changing it: `backend-switchboard stop`,
+   then launch again.
+2. If your AskSage host uses a private CA, save its certificate and point at it in `~/.backend-switchboard/config.json`:
+   `{"asksage_cert": "~/path/to/asksage.pem"}`. `asksage_url` defaults to `https://api.asksage.anl.gov/server`; change it
+   for another AskSage server.
+3. Use AskSage's own model ids: `/model google-claude-opus-5@asksage`, `/model gpt-4.1@asksage`. To list the ids your
+   account can use, POST to `<asksage_url>/get-models` with an `x-access-tokens: $ASKSAGE_API_KEY` header.
+
+How it works: the router translates Anthropic requests to AskSage's `/query` itself, with no asksage-proxy or llm-rosetta.
+The history goes over as `me`/`gpt` turns and `tools` as a JSON list. AskSage has no field for tool results, so earlier
+tool calls and their results are written into the history as prose, and answers arrive whole, so streaming is emulated.
+Claude models on AskSage handle the full tool loop (Read, ToolSearch, Bash); weaker ones (`gpt-4.1`) often stall on
+deferred tools. Token counts are estimates, and some AskSage models return `model_error` while their upstream is down.
 
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
