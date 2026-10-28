@@ -7,11 +7,11 @@ One local endpoint that lets Claude Code switch between several model backends w
 | `claude-sonnet-5-5` (no tag) | Anthropic, using your own Claude Code login. Requests are forwarded untouched. |
 | `claude-sonnet-5-5@argo` | [Argo](https://github.com/n-getty/argo-shim) through a running `argo-shim` |
 | `claude-opus-5-5@google@mag` | A LiteLLM-style gateway with Bearer auth (AMSC "MAG"); the tag `@mag` is stripped and `@google` is MAG's own suffix |
-| `beam@alcf`, `muse@alcf` | ALCF inference endpoints (OpenAI chat), translated to the Anthropic API by [llm-rosetta](https://github.com/Oaklight/llm-rosetta) |
+| `beam@alcf`, `muse@alcf` | ALCF inference endpoints, which serve the Anthropic Messages API natively |
 
 Claude Code only accepts one `ANTHROPIC_BASE_URL` per session, so the switch has to happen behind that URL.
 backend-switchboard is that URL. It reads the model name, picks a backend, swaps in that backend's credentials, and
-streams the response back. Standard library only (Python 3.8+), except for the optional ALCF translation.
+streams the response back. Standard library only, Python 3.8+. No other services to run.
 
 > Not affiliated with Anthropic. The Anthropic route forwards your Claude Code login (OAuth or API key) unchanged and
 > never reads, stores or logs it. Check your plan's terms before sending subscription traffic through a local proxy.
@@ -20,16 +20,15 @@ streams the response back. Standard library only (Python 3.8+), except for the o
 Claude Code --> 127.0.0.1:8790 (backend-switchboard) --+--> api.anthropic.com        (no tag)
    /model name[@tag]                                   +--> argo-shim                (@argo)
                                                        +--> MAG                      (@mag)
-                                                       +--> llm-rosetta --> ALCF     (@alcf)
+                                                       +--> ALCF Minerva             (@alcf)
 ```
 
 ## Install
 
 ```bash
-pip install backend-switchboard            # Anthropic, @argo, @mag
-pip install 'backend-switchboard[alcf]'    # adds llm-rosetta for @alcf (Python 3.10+)
+pip install backend-switchboard
 # or without installing:
-uvx --with 'llm-rosetta==0.7.3' backend-switchboard run
+uvx backend-switchboard run
 ```
 
 ## Use
@@ -60,16 +59,17 @@ model answer.
 **MAG (`@mag`).** Export `AMSC_TOKEN` in the environment the router starts from. Set `mag_url` in `config.json` to
 point at another Bearer-auth gateway. MAG's own provider suffixes stay in the name: `claude-opus-5-5@google@mag`.
 
-**ALCF (`@alcf`).** Install the `alcf` extra, then log in once in your own terminal:
+**ALCF (`@alcf`).** Install the ALCF token tools and log in once, in your own terminal:
 
 ```bash
 uv tool install alcf-ai alcf-tokens
 alcf-tokens login inference
 ```
 
-The router starts and supervises an llm-rosetta gateway, and restarts it whenever your ALCF token rotates (the gateway
-only reads the token at startup). Aliases `beam` and `muse` map to `beam-1.0-bf16` and `muse-spark-bf16`; any other
-name is passed through. Add or change aliases under `aliases.alcf` in `config.json`.
+The router runs `alcf-tokens get-token inference` (cached for two minutes), or uses `ALCF_INFERENCE_TOKEN` if you set it.
+ALCF's Minerva endpoint accepts the Anthropic Messages API directly with a Bearer token, so requests are forwarded as they
+are, including streaming, tool calls and the models' thinking blocks. Aliases `beam` and `muse` map to `beam-1.0-bf16`
+and `muse-spark-bf16`; any other name is passed through. Add or change aliases under `aliases.alcf` in `config.json`.
 
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
@@ -94,10 +94,7 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `anthropic_url` | `https://api.anthropic.com` | no-tag route |
 | `mag_url` | the AMSC MAG host | `@mag` route |
 | `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
-| `alcf_url` | ALCF Minerva `/api/v1` | OpenAI-compatible endpoint behind `@alcf` |
-| `rosetta_python` | the current interpreter | Python that has llm-rosetta installed |
-| `rosetta_port` | `8768` | local port for the llm-rosetta child |
-| `alcf_gateway`, `alcf_gateway_key` | unset | use your own Anthropic-compatible gateway for `@alcf` instead of llm-rosetta |
+| `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
 | `aliases` | `beam`, `muse` | short names per backend |
 
 ## Security
@@ -112,12 +109,14 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 
 - Tested live: your Anthropic login, ALCF Beam and Muse, and a single conversation switched across backends between turns.
   The Argo and MAG routes are covered by mock-upstream tests only.
-- Muse did not manage to call a no-argument tool (`CronList`) even with every tool inlined, while Beam did. This is model
+- Beam handled loading a deferred tool with `ToolSearch` and then calling it reliably in every run. Muse was inconsistent: in two
+  runs, one succeeded and one looped on tool calls until the client timed out. All requests returned 200, so this is model
   behavior, not routing.
 - When a backend is down or returns a 5xx, Claude Code retries for a few minutes, so a stopped Argo tunnel looks like a
   hang. Check `~/.backend-switchboard/router.log`.
-- Each ALCF turn includes one request that the gateway answers with HTTP 405 (a token-count call). Claude Code falls back
-  and the turn completes.
+- ALCF does not implement the token-count endpoint (404). Claude Code falls back and the turn completes.
+- Switching between an Anthropic model and ALCF models worked in testing (history includes the ALCF thinking blocks), but not
+  with extended thinking enabled on the Anthropic side.
 - Not covered: the interactive `/model` picker UI (typing the name works), and prompt-cache behavior across backends.
 
 ## Tests

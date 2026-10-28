@@ -22,10 +22,6 @@ classifiers = [
 ]
 keywords = ["claude-code", "proxy", "router", "argo", "alcf", "llm-gateway", "anthropic"]
 
-[project.optional-dependencies]
-# Only needed for @alcf (translates the Anthropic API to OpenAI chat). Requires Python 3.10+.
-alcf = ["llm-rosetta==0.7.3; python_version >= '3.10'"]
-
 [project.urls]
 Homepage = "https://github.com/n-getty/backend-switchboard"
 Repository = "https://github.com/n-getty/backend-switchboard"

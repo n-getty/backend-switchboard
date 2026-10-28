@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 tmp = tempfile.mkdtemp()
 os.environ["BACKEND_SWITCHBOARD_HOME"] = tmp
 os.environ["AMSC_TOKEN"] = "MAGTOKEN"
+os.environ["ALCF_INFERENCE_TOKEN"] = "ALCFTOKEN"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import backend_switchboard._router as cr  # noqa: E402
 
@@ -51,7 +52,7 @@ argo_settings = os.path.join(tmp, "argo_settings.json")
 json.dump({"apiKeyHelper": "echo 'ARGOTOKEN'", "env": {"ANTHROPIC_BASE_URL": urls["argo"] + "/argoapi"}},
           open(argo_settings, "w"))
 json.dump({"port": 0, "anthropic_url": urls["anthropic"], "mag_url": urls["mag"],
-           "argo_settings": argo_settings, "alcf_gateway": urls["alcf"], "alcf_gateway_key": "GWKEY"},
+           "argo_settings": argo_settings, "alcf_url": urls["alcf"]},
           open(os.path.join(tmp, "config.json"), "w"))
 cr.cmd_init(cr.load_config())
 KEY = cr.read_key()
@@ -105,7 +106,9 @@ check("@argo: client OAuth not forwarded", "authorization" not in g["h"])
 
 post("beam@alcf")
 l = SEEN["alcf"]
-check("@alcf: alias beam -> beam-1.0-bf16, gateway key used", l["body"]["model"] == "beam-1.0-bf16" and l["h"].get("x-api-key") == "GWKEY")
+check("@alcf: alias beam -> beam-1.0-bf16, Bearer ALCF token, client auth dropped",
+      l["body"]["model"] == "beam-1.0-bf16" and l["h"].get("authorization") == "Bearer ALCFTOKEN" and "x-api-key" not in l["h"])
+check("@alcf: path is /v1/messages (native, no translation)", l["path"] == "/v1/messages")
 post("some-new-model@alcf")
 check("@alcf: unknown names pass through", SEEN["alcf"]["body"]["model"] == "some-new-model")
 

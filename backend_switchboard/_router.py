@@ -4,15 +4,12 @@
   claude-opus-5-5              -> Anthropic (your subscription; client headers pass through untouched)
   claude-opus-5-5@google@mag   -> AMSC MAG   (router tag @mag is stripped; "@google" is MAG's own suffix)
   claude-opus-5-5@argo         -> Argo via argo-shim
-  beam@alcf / muse@alcf        -> ALCF Minerva via a managed llm-rosetta gateway (Anthropic -> OpenAI chat)
+  beam@alcf / muse@alcf        -> ALCF Minerva (serves the Anthropic Messages API natively; Bearer token)
 
 Standard library only (3.8+). Upstream credentials are read per request and never logged.
 """
 import argparse
-import atexit
-import hashlib
 import hmac
-import importlib.util
 import http.client
 import json
 import os
@@ -42,11 +39,7 @@ DEFAULTS = {
     "mag_url": "https://mag.genesis.americansciencecloud.org",
     "argo_settings": os.path.join(HOME, ".claude", "settings.json"),
     "argo_url": None,
-    "alcf_url": "https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1",
-    "alcf_gateway": None,
-    "alcf_gateway_key": None,
-    "rosetta_python": None,
-    "rosetta_port": 8768,
+    "alcf_url": "https://inference-api.alcf.anl.gov/resource_server/minerva/api",
     "aliases": {"alcf": {"beam": "beam-1.0-bf16", "muse": "muse-spark-bf16"}},
 }
 
@@ -116,109 +109,27 @@ def mag_token():
     return os.environ.get("AMSC_TOKEN")
 
 
-class Rosetta:
-    """Owns the llm-rosetta gateway process that translates Anthropic -> OpenAI chat for ALCF."""
+_alcf = {"lock": threading.Lock(), "token": None, "at": 0.0}
 
-    def __init__(self, cfg):
-        self.cfg, self.lock = cfg, threading.Lock()
-        self.proc, self.tokhash, self.checked = None, None, 0.0
-        self.key = secrets.token_urlsafe(24)
-        atexit.register(self.stop)
 
-    def _token(self):
+def alcf_token():
+    """ALCF inference token: ALCF_INFERENCE_TOKEN if set, else `alcf-tokens get-token inference` (cached 2 min)."""
+    tok = os.environ.get("ALCF_INFERENCE_TOKEN")
+    if tok:
+        return tok
+    with _alcf["lock"]:
+        if _alcf["token"] and time.time() - _alcf["at"] < 120:
+            return _alcf["token"]
         exe = shutil.which("alcf-tokens") or os.path.join(HOME, ".local/bin/alcf-tokens")
         try:
             out = subprocess.run([exe, "get-token", "inference"], capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired):
             return None
-        return out.stdout.strip() or None
-
-    def _healthy(self):
-        try:
-            c = http.client.HTTPConnection("127.0.0.1", self.cfg["rosetta_port"], timeout=2)
-            c.request("GET", "/health")
-            return c.getresponse().status == 200
-        except OSError:
-            return False
-
-    def _pidfile(self):
-        return os.path.join(DIR, "rosetta.pid")
-
-    def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        self.proc = None
-        self._kill_orphan()
-
-    def _kill_orphan(self):
-        """A gateway left by a router that died without cleanup would hold the port with a stale key."""
-        try:
-            pid = int(open(self._pidfile()).read())
-            if b"llm_rosetta" not in open("/proc/%d/cmdline" % pid, "rb").read():
-                raise OSError("pid %d is not our gateway" % pid)
-            os.kill(pid, 15)
-            for _ in range(12):
-                os.kill(pid, 0)  # raises once the process is gone
-                time.sleep(0.25)
-            os.kill(pid, 9)
-        except (OSError, ValueError):
-            pass
-        try:
-            os.remove(self._pidfile())
-        except OSError:
-            pass
-
-    def ensure(self):
-        with self.lock:
-            now = time.time()
-            alive = self.proc is not None and self.proc.poll() is None
-            if alive and now - self.checked < 120:
-                return
-            tok = self._token()
-            if not tok:
-                raise RouteError(401, "no ALCF token; run in your own terminal: alcf-tokens login inference")
-            h = hashlib.sha256(tok.encode()).hexdigest()
-            if alive and h == self.tokhash:
-                self.checked = now
-                return
-            self.stop()  # the gateway reads ${ALCF_INFERENCE_TOKEN} only at startup; also clears orphans
-            conf = os.path.join(DIR, "rosetta.jsonc")
-            with open(conf, "w") as f:
-                json.dump({
-                    "providers": {"alcf": {"type": "openai_chat", "api_key": "${ALCF_INFERENCE_TOKEN}",
-                                           "base_url": self.cfg["alcf_url"]}},
-                    "models": {m: "alcf" for m in set(self.cfg["aliases"]["alcf"].values())},
-                    "server": {"host": "127.0.0.1", "port": self.cfg["rosetta_port"], "api_key": "${ROUTER_GATEWAY_KEY}"},
-                }, f)
-            py = self.cfg["rosetta_python"]
-            if not py:
-                if importlib.util.find_spec("llm_rosetta") is None:
-                    raise RouteError(502, "@alcf needs llm-rosetta: pip install 'backend-switchboard[alcf]' "
-                                          "(Python 3.10+), or set rosetta_python in %s/config.json" % DIR)
-                py = sys.executable
-            env = dict(os.environ, ALCF_INFERENCE_TOKEN=tok, ROUTER_GATEWAY_KEY=self.key)
-            log = open(os.path.join(DIR, "rosetta.log"), "ab")
-            self.proc = subprocess.Popen([py, "-m", "llm_rosetta.gateway", "--config", conf,
-                                          "--no-banner"], env=env, stdout=log, stderr=log)
-            with open(self._pidfile(), "w") as f:
-                f.write(str(self.proc.pid))
-            for _ in range(30):
-                if self.proc.poll() is not None:
-                    break
-                if self._healthy():
-                    break
-                time.sleep(0.5)
-            if self.proc.poll() is not None or not self._healthy():
-                self.stop()
-                raise RouteError(502, "llm-rosetta gateway failed to start; see %s/rosetta.log" % DIR)
-            self.tokhash, self.checked = h, now
+        _alcf["token"], _alcf["at"] = out.stdout.strip() or None, time.time()
+        return _alcf["token"]
 
 
-def resolve(cfg, rosetta, model, client_headers):
+def resolve(cfg, model):
     """Return (base_url, extra_headers, drop_client_auth, upstream_model, backend)."""
     base, tag = split_model(model)
     if tag is None:
@@ -239,11 +150,10 @@ def resolve(cfg, rosetta, model, client_headers):
         if not tok or not url:
             raise RouteError(502, "cannot read argo-shim token/base URL from %s" % cfg["argo_settings"])
         return url, {"x-api-key": tok}, True, base, tag
-    gw, key = cfg["alcf_gateway"], cfg["alcf_gateway_key"]
-    if not gw:
-        rosetta.ensure()
-        gw, key = "http://127.0.0.1:%d" % cfg["rosetta_port"], rosetta.key
-    return gw, {"x-api-key": key}, True, cfg["aliases"]["alcf"].get(base, base), tag
+    tok = alcf_token()
+    if not tok:
+        raise RouteError(401, "no ALCF token; run in your own terminal: alcf-tokens login inference")
+    return cfg["alcf_url"], {"authorization": "Bearer " + tok}, True, cfg["aliases"]["alcf"].get(base, base), tag
 
 
 def flatten_tool_search(obj):
@@ -275,7 +185,7 @@ def flatten_tool_search(obj):
 
 
 class Handler(BaseHTTPRequestHandler):
-    cfg = rosetta = key = None
+    cfg = key = None
     server_version = "backend-switchboard"
 
     def log_message(self, *a):
@@ -327,7 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                     obj = None
                 if isinstance(obj, dict) and isinstance(obj.get("model"), str):
                     model = obj["model"]
-            url, extra, drop_auth, up_model, backend = resolve(self.cfg, self.rosetta, model, self.headers) \
+            url, extra, drop_auth, up_model, backend = resolve(self.cfg, model) \
                 if model != "-" else (self.cfg["anthropic_url"], {}, False, None, "anthropic")
             if model != "-":
                 dirty = up_model != model
@@ -398,7 +308,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def build_server(cfg):
-    Handler.cfg, Handler.key, Handler.rosetta = cfg, read_key(), Rosetta(cfg)
+    Handler.cfg, Handler.key = cfg, read_key()
     ThreadingHTTPServer.daemon_threads = True
     return ThreadingHTTPServer(("127.0.0.1", cfg["port"]), Handler)
 
@@ -477,7 +387,7 @@ def main():
         cmd_init(cfg)
     elif cmd == "serve":
         srv = build_server(cfg)
-        signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))  # lets atexit stop the gateway child
+        signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
