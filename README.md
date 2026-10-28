@@ -73,6 +73,47 @@ and `muse-spark-bf16`; any other name is passed through. Add or change aliases u
 
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
+## Auto routing (`/model auto`)
+
+`/model auto` sends each request to a cheap or a strong backend depending on how hard the user's latest request is.
+A small decision model, [LiquidAI d1-3B](https://huggingface.co/LiquidAI/d1-3B), scores the prompt in one forward pass
+(no generated tokens); the router turns the score into a tier and takes the first healthy backend configured for it.
+Tiers hold ordinary model names, so every tag, alias and credential rule above applies unchanged.
+
+```json
+{
+  "auto": {
+    "d1_url": "http://x4712c2s2b0n0:8781",
+    "tiers": {
+      "small":  ["claude-haiku-5-5@google@mag", "beam@alcf"],
+      "medium": ["claude-sonnet-5-5@argo"],
+      "large":  ["claude-opus-5-5@argo", "claude-opus-5-5@google@mag"]
+    }
+  }
+}
+```
+
+- **What d1 reads.** The latest typed user turn, not tool results or Claude Code's injected reminders. A very short
+  turn ("yes", "continue") is judged together with the previous one. The decision is cached per prompt, so the many
+  requests of one agent loop cost one d1 call.
+- **d1 service.** `POST {d1_url}/features` with `{"text": "..."}` returns `{"features": {"expert": ..., "difficulty": ...}}`.
+  [`llm_router/d1_service.py`](https://github.com/n-getty/llm-router) is a ready implementation (GPU node, FastAPI).
+  If the service is unset, down or slower than `d1_timeout` (2 s), a keyword/length heuristic decides instead; routing
+  never fails a request. After three d1 failures it is skipped for 30 s.
+- **Fallback.** If the chosen backend answers 429/5xx or cannot be reached before sending anything, the router tries the
+  next candidate: the rest of the tier, then higher tiers, then lower ones. A backend that fails 3 times in a row is
+  tried last for 60 s. A failure in the middle of a stream cannot be retried.
+- **Policy.** `hardness = offset + Σ weight × feature`; a request stays in the first tier whose `cut` it is below
+  (`null` = never stop there). `floor`, `ceiling` and `quality_bias` (>0 favours cheaper tiers) adjust it. The defaults
+  come from one 600-prompt benchmark and do not transfer between datasets, so calibrate from your own traffic.
+- **Telemetry.** `~/.backend-switchboard/auto.jsonl` has one line per decision: tier, hardness, source, candidates tried,
+  backend, status, latency. It holds a hash of the prompt, never the text. With `"shadow": true`, requests that name a
+  model explicitly are still scored and logged (`shadow: true`, `would_use`) without changing where they go, so you can
+  measure the router before trusting it.
+- **Try it without sending anything:** `backend-switchboard decide "prove the lemma"` prints the tier and candidate chain.
+
+Not done yet: quota-aware routing (needs per-backend usage accounting) and capability filters (vision, context size).
+
 ## Tool search
 
 `init` sets `ENABLE_TOOL_SEARCH=true`, which defers most tool definitions and cuts the request size (about 37% fewer
@@ -96,6 +137,7 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
 | `aliases` | `beam`, `muse` | short names per backend |
+| `auto` | unset | enables `/model auto`; see [Auto routing](#auto-routing-model-auto) |
 
 ## Security
 

@@ -5,6 +5,7 @@
   claude-opus-5-5@google@mag   -> AMSC MAG   (router tag @mag is stripped; "@google" is MAG's own suffix)
   claude-opus-5-5@argo         -> Argo via argo-shim
   beam@alcf / muse@alcf        -> ALCF Minerva (serves the Anthropic Messages API natively; Bearer token)
+  auto                         -> whichever of the above config.json "auto.tiers" picks for the request's difficulty
 
 Standard library only (3.8+). Upstream credentials are read per request and never logged.
 """
@@ -24,6 +25,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+
+from . import _auto as auto_mod
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("BACKEND_SWITCHBOARD_HOME", os.path.join(HOME, ".backend-switchboard"))
@@ -208,8 +211,16 @@ def flatten_tool_search(obj):
     return changed
 
 
+class Retryable(Exception):
+    """A backend failed before sending anything to the client; `auto` may try the next candidate."""
+
+    def __init__(self, status, backend):
+        Exception.__init__(self, "retryable %s from %s" % (status, backend))
+        self.status, self.backend = status, backend
+
+
 class Handler(BaseHTTPRequestHandler):
-    cfg = key = None
+    cfg = key = auto = None
     server_version = "backend-switchboard"
 
     def log_message(self, *a):
@@ -251,9 +262,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(401, "missing or wrong x-router-key")
         n = int(self.headers.get("content-length") or 0)
         raw = self.rfile.read(n) if n else b""
-        model, backend = "-", "?"
+        model, backend, plan, chosen, attempts = "-", "?", None, None, []
         try:
-            body = raw
+            obj = None
             if raw and self.path.split("?")[0].startswith("/v1/messages"):
                 try:
                     obj = json.loads(raw)
@@ -261,17 +272,32 @@ class Handler(BaseHTTPRequestHandler):
                     obj = None
                 if isinstance(obj, dict) and isinstance(obj.get("model"), str):
                     model = obj["model"]
-            url, extra, drop_auth, up_model, backend = resolve(self.cfg, model) \
-                if model != "-" else (self.cfg["anthropic_url"], {}, False, None, "anthropic")
-            if model != "-":
-                dirty = up_model != model
-                obj["model"] = up_model
-                if backend != "anthropic":
-                    dirty = flatten_tool_search(obj) or dirty
-                    dirty = strip_client_extensions(obj) or dirty
-                if dirty:
-                    body = json.dumps(obj).encode()
-            status = self._forward(url, extra, drop_auth, body, backend)
+            if self.auto and model != "-":
+                if auto_mod.wants(model):
+                    plan = self.auto.plan(obj)
+                    if plan is None:
+                        raise RouteError(400, "model 'auto' needs auto.tiers in %s/config.json" % DIR)
+                elif self.auto.c["shadow"]:
+                    self.auto.shadow(obj, model)
+            candidates = plan.candidates if plan else [model]
+            for i, cand in enumerate(candidates):
+                last = i == len(candidates) - 1
+                try:
+                    # obj is mutated by each attempt, so later attempts start from the original bytes
+                    status, backend = self._route_once(raw, obj if i == 0 else json.loads(raw), cand,
+                                                       retry_ok=plan is not None and not last)
+                    chosen = cand
+                    if plan:
+                        (self.auto.backends.fail if status in auto_mod.RETRYABLE else self.auto.backends.success)(cand)
+                    break
+                except Retryable as r:
+                    self.auto.backends.fail(cand)
+                    attempts.append([cand, r.status])
+                    status, backend = r.status, r.backend
+                except RouteError as e:
+                    if plan is None or last:
+                        raise
+                    attempts.append([cand, e.status])
         except RouteError as e:
             status = e.status
             self._err(e.status, e.message)
@@ -282,11 +308,33 @@ class Handler(BaseHTTPRequestHandler):
                 self._err(status, "router/upstream error: %s" % e)
             except OSError:
                 pass
-        sys.stderr.write("%s %-40s -> %s %s %.2fs\n" % (time.strftime("%H:%M:%S"), model[:40],
+        label = "%s>%s" % (model, chosen) if plan else model
+        if plan:
+            self.auto.record(requested=model, tier=plan.tier, decision=plan.decision, attempts=attempts,
+                             chosen=chosen, backend=backend, status=status, total_ms=round((time.time() - t0) * 1000))
+        sys.stderr.write("%s %-40s -> %s %s %.2fs\n" % (time.strftime("%H:%M:%S"), label[:40],
                          backend, status, time.time() - t0))
         sys.stderr.flush()
 
-    def _forward(self, url, extra, drop_auth, body, backend):
+    def _route_once(self, raw, obj, model, retry_ok):
+        """Resolve `model` to a backend, rewrite the request for it and forward. Returns (status, backend)."""
+        body = raw
+        if model == "-":
+            url, extra, drop_auth, up_model, backend = self.cfg["anthropic_url"], {}, False, None, "anthropic"
+        else:
+            url, extra, drop_auth, up_model, backend = resolve(self.cfg, model)
+            dirty = up_model != obj["model"]
+            obj["model"] = up_model
+            if backend != "anthropic":
+                dirty = flatten_tool_search(obj) or dirty
+                dirty = strip_client_extensions(obj) or dirty
+            if dirty:
+                body = json.dumps(obj).encode()
+        return self._forward(url, extra, drop_auth, body, backend, retry_ok), backend
+
+    def _forward(self, url, extra, drop_auth, body, backend, retry_ok=False):
+        """Forward one request and stream the answer back. With retry_ok, a retryable failure that happens before
+        any byte reaches the client raises Retryable instead, so the caller can try another backend."""
         u = urlsplit(url)
         headers = {}
         for k, v in self.headers.items():
@@ -303,12 +351,25 @@ class Handler(BaseHTTPRequestHandler):
             conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=900, context=ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
-        conn.request(self.command, u.path.rstrip("/") + self.path, body or None, headers)
-        resp = conn.getresponse()
+        try:
+            conn.request(self.command, u.path.rstrip("/") + self.path, body or None, headers)
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException):
+            conn.close()
+            if retry_ok:
+                raise Retryable(502, backend)
+            raise
+        if retry_ok and resp.status in auto_mod.RETRYABLE:
+            resp.read()
+            conn.close()
+            raise Retryable(resp.status, backend)
         first = b""
         if backend == "argo" and resp.status == 200:
             first = resp.read1(8192)
             if any(s in first[:4000] for s in SOFT_ERRORS):
+                if retry_ok:
+                    conn.close()
+                    raise Retryable(429, backend)
                 self._err(429, "Argo returned a usage/quota notice (HTTP 200 soft error): " + first[:300].decode("utf8", "replace"))
                 conn.close()
                 return 429
@@ -334,6 +395,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def build_server(cfg):
     Handler.cfg, Handler.key = cfg, read_key()
+    Handler.auto = auto_mod.Auto(cfg, DIR) if cfg.get("auto") else None
+    if Handler.auto:
+        Handler.auto.warm_up()
     ThreadingHTTPServer.daemon_threads = True
     return ThreadingHTTPServer(("127.0.0.1", cfg["port"]), Handler)
 
@@ -404,11 +468,17 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "run":  # everything after "run" belongs to claude
         return cmd_run(load_config(), sys.argv[2:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["init", "serve", "ensure", "stop"],
+    ap.add_argument("command", choices=["init", "serve", "ensure", "stop", "decide"],
                     help="run [claude args...] is also accepted: starts the router if needed, then launches claude")
-    cmd = ap.parse_args().command
+    ap.add_argument("text", nargs="?", help="decide: the prompt to classify (default: read stdin)")
+    args = ap.parse_args()
+    cmd = args.command
     cfg = load_config()
-    if cmd == "init":
+    if cmd == "decide":
+        a = auto_mod.Auto(cfg, DIR)
+        d = a.decide(args.text if args.text is not None else sys.stdin.read())
+        print(json.dumps({"decision": d, "candidates": a.candidates(d["tier"])}, indent=2))
+    elif cmd == "init":
         cmd_init(cfg)
     elif cmd == "serve":
         srv = build_server(cfg)
