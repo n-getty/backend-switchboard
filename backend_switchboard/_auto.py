@@ -23,6 +23,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+from . import _arms
+
 TIERS = ("small", "medium", "large")
 AUTO_MODEL = "auto"
 RETRYABLE = (429, 500, 502, 503, 504, 529)
@@ -33,7 +35,14 @@ RETRYABLE = (429, 500, 502, 503, 504, 529)
 DEFAULTS = {
     "d1_url": None,            # e.g. http://x4712c2s2b0n0:8781 ; None -> heuristic only
     "d1_timeout": 2.0,
-    "tiers": {},               # {"small": ["claude-haiku-5-5@mag", "beam@alcf"], "medium": [...], "large": [...]}
+    "tiers": {},               # fixed ladder {"small": [...], "medium": [...], "large": [...]}; if empty, arms are used
+    "arms": {},                # override/extend the built-in model registry (see _arms.py)
+    "enabled_arms": None,      # restrict the registry to these arm names
+    "margin": 0.08,            # accept the cheapest arm whose P(success) is within this of the best: higher = cheaper
+    "slope": 8.0,              # how sharply P(success) falls as a request outgrows an arm's skill
+    "unc_weight": 1.0,         # how much to distrust weakly-evidenced skills
+    "est_output_tokens": 1500,
+    "pool_scale": {},          # per-pool scarcity multiplier on list price, e.g. {"argo": 2.0}
     "floor": "small",
     "ceiling": "large",
     "weights": {"expert": 3.752659678844416, "difficulty": 2.2941577300354083},
@@ -125,13 +134,21 @@ class Breaker:
                 self.n[key], self.until[key] = 0, time.time() + self.cooldown
 
 
+def heuristic_features(text, tier):
+    """d1-shaped features for the arms chooser when d1 is unavailable."""
+    code = 1.0 if _CODE.search(text) else 0.0
+    return {"_hardness": {"small": -1.5, "medium": -0.45, "large": 2.0}[tier],
+            "domain=code": code, "domain=chat": 1.0 - code}
+
+
 class Plan:
     def __init__(self, tier, candidates, decision):
         self.tier, self.candidates, self.decision = tier, candidates, decision
 
 
 class Auto:
-    def __init__(self, cfg, home):
+    def __init__(self, cfg, home, backends=()):
+        self.backends_available = set(backends)
         self.c = auto_config(cfg)
         self.log_path = os.path.join(home, "auto.jsonl")
         self.cache, self.lock = {}, threading.Lock()
@@ -165,9 +182,14 @@ class Auto:
         finally:
             conn.close()
 
+    def hardness(self, f):
+        if "_hardness" in f:
+            return f["_hardness"]
+        return self.c["offset"] + sum(w * f.get(k, 0.0) for k, w in self.c["weights"].items())
+
     def _hardness_tier(self, f):
         c = self.c
-        h = c["offset"] + sum(w * f.get(k, 0.0) for k, w in c["weights"].items())
+        h = self.hardness(f)
         lo, hi = TIERS.index(c["floor"]), TIERS.index(c["ceiling"])
         for tier in TIERS[lo:hi + 1]:
             cut = c["cuts"].get(tier)
@@ -176,17 +198,22 @@ class Auto:
         return c["ceiling"], {"hardness": round(h, 3)}
 
     def decide(self, text):
+        return self.assess(text)[0]
+
+    def assess(self, text):
+        """-> (decision, d1 features). One d1 call per distinct prompt (cached)."""
         key = hashlib.sha1(text.encode("utf8", "replace")).hexdigest()
         now = time.time()
         with self.lock:
             hit = self.cache.get(key)
             if hit and now - hit[0] < self.c["cache_ttl"]:
-                return dict(hit[1], cached=True)
+                return dict(hit[1], cached=True), hit[2]
         t = time.perf_counter()
-        source, tier, detail = "heuristic", None, {}
+        source, tier, detail, f = "heuristic", None, {}, None
         if self.c["d1_url"] and self.d1.ok("d1"):
             try:
-                tier, detail = self._hardness_tier(self._features(text))
+                f = self._features(text)
+                tier, detail = self._hardness_tier(f)
                 source = "d1"
                 self.d1.success("d1")
             except Exception as e:  # never fail the request because routing failed
@@ -194,14 +221,15 @@ class Auto:
                 source = "heuristic (%s)" % type(e).__name__
         if tier is None:
             tier, detail = heuristic_tier(text, self.c["quality_bias"])
+            f = heuristic_features(text, tier)
         d = {"tier": tier, "source": source, "decide_ms": round((time.perf_counter() - t) * 1000, 1),
              "prompt_sha1": key[:12], "prompt_chars": len(text)}
         d.update(detail)
         with self.lock:
             if len(self.cache) > 512:
                 self.cache.clear()
-            self.cache[key] = (now, d)
-        return d
+            self.cache[key] = (now, d, f)
+        return d, f
 
     # --- candidates -----------------------------------------------------------------------------------------------
     def candidates(self, tier):
@@ -218,11 +246,25 @@ class Auto:
         healthy = [m for m in out if self.backends.ok(m)]
         return healthy + [m for m in out if m not in healthy]
 
-    def plan(self, obj):
-        if not any(self.c["tiers"].get(t) for t in TIERS):
+    def arms(self, obj, text, nbytes=0):
+        """Rank the registry for this request. Returns (decision, ranked arms) or (decision, [])."""
+        d, f = self.assess(text)
+        ranked = _arms.rank(self.c, obj, f, self.hardness(f), nbytes, self.backends_available)
+        d = dict(d, mix={t: round(w, 2) for t, w in _arms.task_mix(obj, f).items() if w >= 0.05},
+                 need=round(_arms.need(self.hardness(f)), 2), ranked=ranked[:5])
+        return d, ranked
+
+    def plan(self, obj, nbytes=0):
+        text = routing_text(obj)
+        if any(self.c["tiers"].get(t) for t in TIERS):
+            d = self.decide(text)
+            return Plan(d["tier"], self.candidates(d["tier"]), d)
+        d, ranked = self.arms(obj, text, nbytes)
+        if not ranked:
             return None
-        d = self.decide(routing_text(obj))
-        return Plan(d["tier"], self.candidates(d["tier"]), d)
+        models = [r["model"] for r in ranked]
+        healthy = [m for m in models if self.backends.ok(m)]
+        return Plan(ranked[0]["arm"], healthy + [m for m in models if m not in healthy], d)
 
     # --- telemetry ------------------------------------------------------------------------------------------------
     def record(self, **fields):
@@ -235,10 +277,11 @@ class Auto:
         except OSError:
             pass
 
-    def shadow(self, obj, requested):
+    def shadow(self, obj, requested, nbytes=0):
         """Log what auto would have picked for a request that named a model. Runs off the request path."""
         def run():
-            d = self.decide(routing_text(obj))
-            cands = self.candidates(d["tier"])
-            self.record(shadow=True, requested=requested, tier=d["tier"], would_use=cands[:1], decision=d)
+            p = self.plan(obj, nbytes)
+            if p:
+                self.record(shadow=True, requested=requested, tier=p.tier, would_use=p.candidates[:1],
+                            decision=p.decision)
         threading.Thread(target=run, daemon=True).start()

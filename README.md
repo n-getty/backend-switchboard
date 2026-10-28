@@ -93,6 +93,17 @@ Tiers hold ordinary model names, so every tag, alias and credential rule above a
 }
 ```
 
+- **Dynamic mode (no `tiers`).** Instead of a fixed ladder, the router keeps a registry of *arms* (`_arms.py`): Beam and
+  Muse on ALCF (free), and Haiku, Sonnet and Opus 5.5 on Argo. Each arm has a price, a quota pool, capabilities (images,
+  context size) and a prior skill per task type (terminal work, code, tool use, science, knowledge, chat), read off the
+  models' published benchmarks. For each request the router estimates the task mix (d1's domain answer plus the request's
+  tools) and how demanding it is (d1's hardness), computes each arm's chance of success, and picks the cheapest arm within
+  `margin` (0.08) of the best. The rest, ordered by chance of success, are the fallback chain. Free ALCF arms therefore take
+  whatever they are close enough on; Sonnet takes what is just out of their reach; Opus is chosen only when nothing
+  cheaper is near its level. The skills are priors, not measurements: vendors report different benchmark versions, so
+  cross-family gaps are uncertain (`unc`, subtracted as a penalty). Override or add arms under `auto.arms`, restrict
+  them with `auto.enabled_arms`, and scale a pool's scarcity with `auto.pool_scale` (Argo defaults to 3x list price
+  because its monthly cap is finite). `decide "prompt" --tools Bash Edit` prints the ranking.
 - **What d1 reads.** The latest typed user turn, not tool results or Claude Code's injected reminders. A very short
   turn ("yes", "continue") is judged together with the previous one. The decision is cached per prompt, so the many
   requests of one agent loop cost one d1 call.

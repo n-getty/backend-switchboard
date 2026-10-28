@@ -242,9 +242,29 @@ check("auto: breaker moves a failing backend to the back", cr.Handler.auto.candi
 cr.Handler.auto.c["tiers"] = {"small": ["boom@mag"]}
 s = ask("only candidate fails")
 check("auto: when every candidate fails the last error reaches the client", s == 503)
-cr.Handler.auto.c["tiers"] = {}
-s = ask("no tiers configured")
-check("auto: no tiers configured -> 400 with guidance", s == 400)
+cr.Handler.auto.c["tiers"], cr.Handler.auto.c["enabled_arms"] = {}, []
+s = ask("nothing eligible")
+check("auto: no tiers and no arms -> 400 with guidance", s == 400)
+cr.Handler.auto.c["enabled_arms"] = None
+
+# arms mode (no tiers): the registry is ranked per request
+D1["features"] = dict(EASY, **{"domain=chat": 1.0})
+s = ask("hello there", features=dict(EASY, **{"domain=chat": 1.0}))
+check("arms: easy chat goes to a free ALCF arm", s == 200 and SEEN["alcf"]["body"]["model"] in ("beam-1.0-bf16", "muse-spark-bf16"))
+ranked = cr.Handler.auto.arms({"messages": []}, "x")[0]["ranked"]
+check("arms: ranking is logged with p and cost", ranked and {"arm", "p", "cost"} <= set(ranked[0]))
+D1["features"] = dict(HARD, **{"domain=science": 1.0})
+d, rk = cr.Handler.auto.arms({"messages": []}, "hard science question", 4000)
+check("arms: hard science is not left to a free arm", rk and rk[0]["arm"] in ("opus", "sonnet"))
+img = {"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]}
+check("arms: images only go to vision-capable arms", all(r["arm"] != "beam" for r in cr.Handler.auto.arms(img, "x")[1]))
+check("arms: oversized prompt excludes small-context arms",
+      all(r["arm"] != "beam" for r in cr.Handler.auto.arms({"messages": []}, "x", 4000000)[1]))
+cr.Handler.auto.c["arms"] = {"muse": None, "beam": None}
+check("arms: config can remove an arm", all(r["arm"] not in ("beam", "muse") for r in cr.Handler.auto.arms({"messages": []}, "x")[1]))
+cr.Handler.auto.c["arms"] = {"mine": {"model": "claude-x@mag", "pool": "alcf", "price": [0, 0], "skills": [0.9] * 6}}
+check("arms: config can add an arm", any(r["arm"] == "mine" for r in cr.Handler.auto.arms({"messages": []}, "x")[1]))
+cr.Handler.auto.c["arms"] = {}
 cr.Handler.auto.c["tiers"] = TIERS
 
 text = "ZZ-secret-prompt-text"

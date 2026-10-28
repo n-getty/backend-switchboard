@@ -274,11 +274,12 @@ class Handler(BaseHTTPRequestHandler):
                     model = obj["model"]
             if self.auto and model != "-":
                 if auto_mod.wants(model):
-                    plan = self.auto.plan(obj)
+                    plan = self.auto.plan(obj, len(raw))
                     if plan is None:
-                        raise RouteError(400, "model 'auto' needs auto.tiers in %s/config.json" % DIR)
+                        raise RouteError(400, "model 'auto' has no eligible backend (check auto.tiers / auto.arms / "
+                                              "auto.enabled_arms in %s/config.json)" % DIR)
                 elif self.auto.c["shadow"]:
-                    self.auto.shadow(obj, model)
+                    self.auto.shadow(obj, model, len(raw))
             candidates = plan.candidates if plan else [model]
             for i, cand in enumerate(candidates):
                 last = i == len(candidates) - 1
@@ -395,7 +396,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def build_server(cfg):
     Handler.cfg, Handler.key = cfg, read_key()
-    Handler.auto = auto_mod.Auto(cfg, DIR) if cfg.get("auto") else None
+    Handler.auto = auto_mod.Auto(cfg, DIR, BACKENDS) if cfg.get("auto") else None
     if Handler.auto:
         Handler.auto.warm_up()
     ThreadingHTTPServer.daemon_threads = True
@@ -471,13 +472,17 @@ def main():
     ap.add_argument("command", choices=["init", "serve", "ensure", "stop", "decide"],
                     help="run [claude args...] is also accepted: starts the router if needed, then launches claude")
     ap.add_argument("text", nargs="?", help="decide: the prompt to classify (default: read stdin)")
+    ap.add_argument("--tools", nargs="*", default=[], metavar="NAME",
+                    help="decide: pretend the request carries these tools, e.g. --tools Bash Edit")
     args = ap.parse_args()
     cmd = args.command
     cfg = load_config()
     if cmd == "decide":
-        a = auto_mod.Auto(cfg, DIR)
-        d = a.decide(args.text if args.text is not None else sys.stdin.read())
-        print(json.dumps({"decision": d, "candidates": a.candidates(d["tier"])}, indent=2))
+        a = auto_mod.Auto(cfg, DIR, BACKENDS)
+        text = args.text if args.text is not None else sys.stdin.read()
+        p = a.plan({"messages": [{"role": "user", "content": text}], "tools": [{"name": n} for n in args.tools]})
+        print(json.dumps({"decision": p.decision, "candidates": p.candidates} if p else {"error": "no eligible backend"},
+                         indent=2))
     elif cmd == "init":
         cmd_init(cfg)
     elif cmd == "serve":
