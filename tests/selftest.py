@@ -13,6 +13,7 @@ tmp = tempfile.mkdtemp()
 os.environ["BACKEND_SWITCHBOARD_HOME"] = tmp
 os.environ["AMSC_TOKEN"] = "MAGTOKEN"
 os.environ["ALCF_INFERENCE_TOKEN"] = "ALCFTOKEN"
+os.environ["ASKSAGE_API_KEY"] = "ASKTOKEN"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import backend_switchboard._router as cr  # noqa: E402
 
@@ -31,6 +32,13 @@ def mock(name):
             if body["model"] == "boom":
                 out = b'{"type":"error","error":{"type":"api_error","message":"overloaded"}}'
                 self.send_response(503)
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                return self.wfile.write(out)
+            if self.path.endswith("/query"):
+                out = json.dumps({"message": "\n\nhello", "tool_calls": [{"id": "c1", "type": "function", "function": {
+                    "name": "get_time", "arguments": "{\"tz\": \"UTC\"}"}}] if body.get("tools") else None}).encode()
+                self.send_response(200)
                 self.send_header("content-length", str(len(out)))
                 self.end_headers()
                 return self.wfile.write(out)
@@ -53,7 +61,7 @@ def mock(name):
     return "http://127.0.0.1:%d" % srv.server_address[1]
 
 
-urls = {n: mock(n) for n in ("anthropic", "mag", "argo", "alcf")}
+urls = {n: mock(n) for n in ("anthropic", "mag", "argo", "alcf", "asksage")}
 argo_settings = os.path.join(tmp, "argo_settings.json")
 json.dump({"apiKeyHelper": "echo 'ARGOTOKEN'", "env": {"ANTHROPIC_BASE_URL": urls["argo"] + "/argoapi"}},
           open(argo_settings, "w"))
@@ -84,6 +92,7 @@ threading.Thread(target=d1_srv.serve_forever, daemon=True).start()
 TIERS = {"small": ["claude-small@mag"], "medium": ["claude-mid@argo"], "large": ["claude-big@alcf"]}
 json.dump({"port": 0, "anthropic_url": urls["anthropic"], "mag_url": urls["mag"],
            "argo_settings": argo_settings, "alcf_url": urls["alcf"],
+           "asksage_url": urls["asksage"],
            "auto": {"d1_url": "http://127.0.0.1:%d" % d1_srv.server_address[1], "tiers": TIERS}},
           open(os.path.join(tmp, "config.json"), "w"))
 cr.cmd_init(cr.load_config())
@@ -144,6 +153,23 @@ check("@alcf: path is /v1/messages (native, no translation)", l["path"] == "/v1/
 post("some-new-model@alcf")
 check("@alcf: unknown names pass through", SEEN["alcf"]["body"]["model"] == "some-new-model")
 
+asktools = [{"name": "get_time", "description": "t", "input_schema": {"type": "object"}}]
+asked = {"system": [{"type": "text", "text": "SYS"}], "tools": asktools, "stream": True,
+         "messages": [{"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": [{"type": "text", "text": "ok"}, {"type": "tool_use", "id": "t1", "name": "get_time", "input": {"tz": "UTC"}}]},
+                      {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "12:00"}, {"type": "text", "text": "thanks"}]}]}
+st, out, _, _ = post("gpt-4.1@asksage", extra=asked)
+a = SEEN["asksage"]
+check("@asksage: /query with x-access-tokens, tools as a list, system_prompt, history turns",
+      a["path"] == "/query" and a["h"].get("x-access-tokens") == "ASKTOKEN" and a["body"]["model"] == "gpt-4.1"
+      and a["body"]["system_prompt"] == "SYS" and a["body"]["tools"][0]["function"]["name"] == "get_time"
+      and [t["user"] for t in a["body"]["message"]] == ["me", "gpt", "me"]
+      and "Result of that tool call:)\n12:00" in a["body"]["message"][2]["message"])
+check("@asksage: tool call comes back as an Anthropic SSE tool_use stream",
+      st == 200 and b"message_stop" in out and b'"stop_reason": "tool_use"' in out and b'"partial_json": "{\\"tz\\": \\"UTC\\"}"' in out, out[-300:])
+st, out, _, _ = post("gpt-4.1@asksage", extra={"messages": [{"role": "user", "content": "hi"}]})
+check("@asksage: plain answer as a non-streaming message", st == 200 and json.loads(out)["content"][0]["text"] == "hello" and json.loads(out)["stop_reason"] == "end_turn", out)
+
 ts = {"tools": [{"name": "Read", "input_schema": {}}, {"name": "DeferredToolPlaceholder", "defer_loading": True, "input_schema": {}}],
       "messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
                                                  "content": [{"type": "tool_reference", "tool_name": "WebFetch"}]}]}]}
@@ -164,6 +190,16 @@ for tag in ("mag", "argo", "alcf"):
     post("claude-x@" + tag, extra=ext)
     m0 = SEEN[tag]["body"]["messages"][0]
     check("extensions stripped for @" + tag, set(m0) == {"role", "content"} and [b["type"] for b in m0["content"]] == ["text"])
+
+from backend_switchboard import _asksage as _ask  # noqa: E402
+m, _ = _ask.to_message({"message": "Done. [tool_use functions.get_time id=x] {\"tz\": \"UTC\"} bye [tool_use nope] {}"},
+                       {"model": "m", "tools": asktools}, {"message": ""})
+check("@asksage: tool call written as text is recovered (known tools only)",
+      [b["type"] for b in m["content"]] == ["text", "tool_use"] and m["content"][1]["input"] == {"tz": "UTC"}
+      and m["stop_reason"] == "tool_use" and "[tool_use nope]" in m["content"][0]["text"], str(m))
+post("claude-x@asksage", extra=ts)
+check("tool search flattened for @asksage", [t["function"]["name"] for t in SEEN["asksage"]["body"]["tools"]] == ["Read"]
+      and "Tool loaded: WebFetch" in SEEN["asksage"]["body"]["message"][-1]["message"])
 
 s, body, _, _ = post("claude-opus-5-5@google")
 check("ambiguous '@google' -> 400 with guidance", s == 400 and b"@mag" in body)

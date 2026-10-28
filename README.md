@@ -8,6 +8,7 @@ One local endpoint that lets Claude Code switch between several model backends w
 | `claude-sonnet-5-5@argo` | [Argo](https://github.com/n-getty/argo-shim) through a running `argo-shim` |
 | `claude-opus-5-5@google@mag` | A LiteLLM-style gateway with Bearer auth (AMSC "MAG"); the tag `@mag` is stripped and `@google` is MAG's own suffix |
 | `beam@alcf`, `muse@alcf` | ALCF inference endpoints, which serve the Anthropic Messages API natively |
+| `google-claude-opus-5@asksage` | AskSage models, translated in-process to AskSage's `/query` API |
 
 Claude Code only accepts one `ANTHROPIC_BASE_URL` per session, so the switch has to happen behind that URL.
 backend-switchboard is that URL. It reads the model name, picks a backend, swaps in that backend's credentials, and
@@ -70,6 +71,24 @@ The router runs `alcf-tokens get-token inference` (cached for two minutes), or u
 ALCF's Minerva endpoint accepts the Anthropic Messages API directly with a Bearer token, so requests are forwarded as they
 are, including streaming, tool calls and the models' thinking blocks. Aliases `beam` and `muse` map to `beam-1.0-bf16`
 and `muse-spark-bf16`; any other name is passed through. Add or change aliases under `aliases.alcf` in `config.json`.
+
+**AskSage (`@asksage`).** Setup:
+
+1. Get an AskSage API key from your AskSage account settings (for ANL: https://api.asksage.anl.gov) and export it in the
+   shell that starts the router, e.g. in `~/.bashrc`: `export ASKSAGE_API_KEY=...`. The router reads it per request and
+   never logs it. It reads only the environment, so restart the router after changing it: `backend-switchboard stop`,
+   then launch again.
+2. If your AskSage host uses a private CA, save its certificate and point at it in `~/.backend-switchboard/config.json`:
+   `{"asksage_cert": "~/path/to/asksage.pem"}`. `asksage_url` defaults to `https://api.asksage.anl.gov/server`; change it
+   for another AskSage server.
+3. Use AskSage's own model ids: `/model google-claude-opus-5@asksage`, `/model gpt-4.1@asksage`. To list the ids your
+   account can use, POST to `<asksage_url>/get-models` with an `x-access-tokens: $ASKSAGE_API_KEY` header.
+
+How it works: the router translates Anthropic requests to AskSage's `/query` itself, with no asksage-proxy or llm-rosetta.
+The history goes over as `me`/`gpt` turns and `tools` as a JSON list. AskSage has no field for tool results, so earlier
+tool calls and their results are written into the history as prose, and answers arrive whole, so streaming is emulated.
+Claude models on AskSage handle the full tool loop (Read, ToolSearch, Bash); weaker ones (`gpt-4.1`) often stall on
+deferred tools. Token counts are estimates, and some AskSage models return `model_error` while their upstream is down.
 
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
@@ -146,6 +165,7 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `anthropic_url` | `https://api.anthropic.com` | no-tag route |
 | `mag_url` | the AMSC MAG host | `@mag` route |
 | `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
+| `asksage_url` / `asksage_cert` | `https://api.asksage.anl.gov/server` / none | AskSage server and optional extra CA bundle |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
 | `aliases` | `beam`, `muse` | short names per backend |
 | `auto` | unset | enables `/model auto`; see [Auto routing](#auto-routing-model-auto) |
