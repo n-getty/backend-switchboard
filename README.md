@@ -8,6 +8,7 @@ One local endpoint that lets Claude Code switch between several model backends w
 | `claude-sonnet-5-5@argo` | [Argo](https://github.com/n-getty/argo-shim) through a running `argo-shim` |
 | `claude-opus-5-5@google@mag` | A LiteLLM-style gateway with Bearer auth (AMSC "MAG"); the tag `@mag` is stripped and `@google` is MAG's own suffix |
 | `beam@alcf`, `muse@alcf` | ALCF inference endpoints, which serve the Anthropic Messages API natively |
+| `google-claude-opus-5@asksage` | AskSage models, translated in-process to AskSage's `/query` API |
 
 Claude Code only accepts one `ANTHROPIC_BASE_URL` per session, so the switch has to happen behind that URL.
 backend-switchboard is that URL. It reads the model name, picks a backend, swaps in that backend's credentials, and
@@ -71,6 +72,15 @@ ALCF's Minerva endpoint accepts the Anthropic Messages API directly with a Beare
 are, including streaming, tool calls and the models' thinking blocks. Aliases `beam` and `muse` map to `beam-1.0-bf16`
 and `muse-spark-bf16`; any other name is passed through. Add or change aliases under `aliases.alcf` in `config.json`.
 
+**AskSage (`@asksage`).** Export `ASKSAGE_API_KEY` in the environment the router starts from (it is read per request and
+never logged). The model name is AskSage's own id, e.g. `/model google-claude-opus-5@asksage` or `gpt-4.1@asksage`. If your
+AskSage host needs an extra CA certificate, set `asksage_cert`; `asksage_url` defaults to `https://api.asksage.anl.gov/server`.
+The router translates Anthropic requests to AskSage's `/query` itself (no asksage-proxy, no llm-rosetta): the history goes
+over as `me`/`gpt` turns, `tools` as a JSON list, and since AskSage has no field for tool results, earlier tool calls and
+their results are written into the history as prose. Answers arrive whole, so streaming is emulated. Claude models on AskSage
+handle the full tool loop (Read, ToolSearch, Bash); weaker ones (`gpt-4.1`) often stall on deferred tools. Token counts are
+estimates, and some AskSage models report `model_error` while the upstream is down.
+
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
 ## Tool search
@@ -94,6 +104,7 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `anthropic_url` | `https://api.anthropic.com` | no-tag route |
 | `mag_url` | the AMSC MAG host | `@mag` route |
 | `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
+| `asksage_url` / `asksage_cert` | `https://api.asksage.anl.gov/server` / none | AskSage server and optional extra CA bundle |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
 | `aliases` | `beam`, `muse` | short names per backend |
 

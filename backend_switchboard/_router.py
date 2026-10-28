@@ -5,6 +5,7 @@
   claude-opus-5-5@google@mag   -> AMSC MAG   (router tag @mag is stripped; "@google" is MAG's own suffix)
   claude-opus-5-5@argo         -> Argo via argo-shim
   beam@alcf / muse@alcf        -> ALCF Minerva (serves the Anthropic Messages API natively; Bearer token)
+  gpt-5.4@asksage              -> AskSage /query (translated in-process; needs ASKSAGE_API_KEY)
 
 Standard library only (3.8+). Upstream credentials are read per request and never logged.
 """
@@ -25,9 +26,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from . import _asksage as asksage
+
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("BACKEND_SWITCHBOARD_HOME", os.path.join(HOME, ".backend-switchboard"))
-BACKENDS = ("anthropic", "argo", "mag", "alcf")
+BACKENDS = ("anthropic", "argo", "mag", "alcf", "asksage")
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
        "transfer-encoding", "upgrade", "host", "content-length"}
 SOFT_ERRORS = (b"ACCESS REVOKED", b"IMPORTANT USAGE NOTICE")
@@ -40,6 +43,8 @@ DEFAULTS = {
     "argo_settings": os.path.join(HOME, ".claude", "settings.json"),
     "argo_url": None,
     "alcf_url": "https://inference-api.alcf.anl.gov/resource_server/minerva/api",
+    "asksage_url": "https://api.asksage.anl.gov/server",
+    "asksage_cert": None,  # extra CA bundle (ANL's AskSage cert), e.g. ~/.config/asksage_proxy/asksage_anl_gov.pem
     "aliases": {"alcf": {"beam": "beam-1.0-bf16", "muse": "muse-spark-bf16"}},
 }
 
@@ -150,6 +155,8 @@ def resolve(cfg, model):
         if not tok or not url:
             raise RouteError(502, "cannot read argo-shim token/base URL from %s" % cfg["argo_settings"])
         return url, {"x-api-key": tok}, True, base, tag
+    if tag == "asksage":
+        return cfg["asksage_url"], {}, True, base, tag
     tok = alcf_token()
     if not tok:
         raise RouteError(401, "no ALCF token; run in your own terminal: alcf-tokens login inference")
@@ -271,7 +278,10 @@ class Handler(BaseHTTPRequestHandler):
                     dirty = strip_client_extensions(obj) or dirty
                 if dirty:
                     body = json.dumps(obj).encode()
-            status = self._forward(url, extra, drop_auth, body, backend)
+            if backend == "asksage":
+                status = asksage.handle(self, self.cfg, obj)
+            else:
+                status = self._forward(url, extra, drop_auth, body, backend)
         except RouteError as e:
             status = e.status
             self._err(e.status, e.message)
@@ -365,7 +375,7 @@ def cmd_init(cfg, quiet=False):
         json.dump(settings, f, indent=2)
     if not quiet:
         print("wrote", kp, "and", sp)
-        print("launch Claude Code with:  backend-switchboard run   (then /model <name>[@argo|@mag|@alcf])")
+        print("launch Claude Code with:  backend-switchboard run   (then /model <name>[@argo|@mag|@alcf|@asksage])")
 
 
 def cmd_ensure(cfg):
