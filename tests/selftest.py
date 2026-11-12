@@ -149,6 +149,10 @@ check("@asksage: tool call comes back as an Anthropic SSE tool_use stream",
 st, out, _, _ = post("gpt-4.1@asksage", extra={"messages": [{"role": "user", "content": "hi"}]})
 check("@asksage: plain answer as a non-streaming message", st == 200 and json.loads(out)["content"][0]["text"] == "hello" and json.loads(out)["stop_reason"] == "end_turn", out)
 
+from backend_switchboard import _copilot as _cop  # noqa: E402
+check("@copilot: model names dotted, dated IDs untouched",
+      [_cop.upstream_name(m) for m in ("claude-opus-5-5", "claude-sonnet-4-20250514", "claude-opus-4-1-20250805")]
+      == ["claude-opus-5.5", "claude-sonnet-4-20250514", "claude-opus-4.1-20250805"])
 post("claude-opus-5-5@copilot")
 c = SEEN["copilot"]
 check("@copilot (Claude): native /v1/messages, dotted name, gh token + Copilot headers, client auth dropped",

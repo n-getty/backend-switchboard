@@ -44,7 +44,7 @@ def token():
 def upstream_name(model):
     """Claude Code says claude-opus-5-5; Copilot says claude-opus-5.5."""
     if model.startswith("claude-"):
-        return re.sub(r"-(\d+)-(\d+)(?=-|$)", r"-\1.\2", model)
+        return re.sub(r"-(\d{1,2})-(\d{1,2})(?=-|$)", r"-\1.\2", model)
     return model
 
 
@@ -65,22 +65,33 @@ def _get(cfg, path, tok):
         conn.close()
 
 
+def _fetch_models(cfg, tok):
+    status, raw = _get(cfg, "/models", tok)
+    if status != 200:
+        raise ValueError("HTTP %s" % status)
+    m = {}
+    for d in json.loads(raw)["data"]:
+        eps = d.get("supported_endpoints") or []
+        m[d["id"]] = ("messages" if "/v1/messages" in eps else "responses" if "/responses" in eps
+                      else "chat" if "/chat/completions" in eps else None)
+    return m
+
+
 def endpoint(cfg, model, tok):
-    """'messages', 'responses' or 'chat' for this model, from Copilot's model list (cached 10 min)."""
+    """'messages', 'responses' or 'chat' for this model, from Copilot's model list (cached 10 min; a failed fetch keeps
+    the old list and is retried after 1 min). The fetch runs outside the lock so a slow /models can't stall requests."""
     with _models["lock"]:
-        if _models["map"] is None or time.time() - _models["at"] > 600:
-            try:
-                status, raw = _get(cfg, "/models", tok)
-                data = json.loads(raw)["data"] if status == 200 else []
-                m = {}
-                for d in data:
-                    eps = d.get("supported_endpoints") or []
-                    m[d["id"]] = ("messages" if "/v1/messages" in eps else "responses" if "/responses" in eps
-                                  else "chat" if "/chat/completions" in eps else None)
-                _models["map"], _models["at"] = m, time.time()
-            except (OSError, ValueError, KeyError, TypeError):
-                _models["map"] = _models["map"] or {}
-        hit = _models["map"].get(model)
+        stale = _models["map"] is None or time.time() > _models["at"]
+        if stale:
+            _models["at"] = time.time() + 60  # claim the refresh; other requests use the old map meanwhile
+    if stale:
+        try:
+            m = _fetch_models(cfg, tok)
+            with _models["lock"]:
+                _models["map"], _models["at"] = m, time.time() + 600
+        except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
+            pass
+    hit = (_models["map"] or {}).get(model)
     return hit or ("messages" if model.startswith("claude-") else "responses")
 
 
@@ -152,8 +163,8 @@ def to_message(d, req):
     content = []
     for it in d.get("output") or []:
         if it.get("type") == "message":
-            text = "".join(c.get("text", "") for c in it.get("content") or [] if c.get("type") == "output_text").strip()
-            if text:
+            text = "".join(c.get("text", "") for c in it.get("content") or [] if c.get("type") == "output_text")
+            if text.strip():
                 content.append({"type": "text", "text": text})
         elif it.get("type") == "function_call":
             try:
@@ -164,16 +175,18 @@ def to_message(d, req):
                             "input": args if isinstance(args, dict) else {}})
     tool = any(b["type"] == "tool_use" for b in content)
     cut = d.get("status") == "incomplete"
+    refused = cut and (d.get("incomplete_details") or {}).get("reason") == "content_filter"
     u = d.get("usage") or {}
     return {"id": "msg_" + (d.get("id") or "x").replace("resp_", "")[:24], "type": "message", "role": "assistant",
             "model": req["model"], "content": content or [{"type": "text", "text": ""}],
-            "stop_reason": "tool_use" if tool else "max_tokens" if cut else "end_turn", "stop_sequence": None,
+            "stop_reason": "tool_use" if tool else "refusal" if refused else "max_tokens" if cut else "end_turn", "stop_sequence": None,
             "usage": {"input_tokens": u.get("input_tokens") or _tokens(req.get("messages", [])),
                       "output_tokens": u.get("output_tokens") or _tokens(content)}}, None
 
 
-def handle(h, cfg, obj, tok, model):
-    """Serve one /v1/messages (or count_tokens) request on handler `h` via /responses; return the status sent."""
+def handle(h, cfg, obj, tok, model, kind):
+    """Serve one /v1/messages (or count_tokens) request on handler `h` via /responses; return the status sent.
+    `kind` is endpoint()'s answer for the model; only non-native ('responses'/'chat') models reach here."""
     def send(status, body, ctype="application/json"):
         h.send_response(status)
         h.send_header("content-type", ctype)
@@ -187,11 +200,11 @@ def handle(h, cfg, obj, tok, model):
     def fail(status, etype, message):
         return send(status, json.dumps({"type": "error", "error": {"type": etype, "message": message}}).encode())
 
-    if endpoint(cfg, model, tok) == "chat":
-        return fail(400, "invalid_request_error", "%s only offers /chat/completions on Copilot, which @copilot does not support" % model)
     req = to_responses(obj)
     if h.path.split("?")[0].endswith("/count_tokens"):
         return send(200, json.dumps({"input_tokens": _tokens(req["input"]) + _tokens(req.get("tools", []))}).encode())
+    if kind == "chat":
+        return fail(400, "invalid_request_error", "%s only offers /chat/completions on Copilot, which @copilot does not support" % model)
     u, conn = _conn(cfg, 900)
     try:
         conn.request("POST", u.path.rstrip("/") + "/responses", json.dumps(req),
@@ -206,7 +219,9 @@ def handle(h, cfg, obj, tok, model):
     if r.status != 200:
         e = d.get("error") if isinstance(d, dict) else None
         msg = e.get("message") if isinstance(e, dict) else raw[:300].decode("utf8", "replace")
-        return fail(r.status, "authentication_error" if r.status == 401 else "api_error", str(msg))
+        etype = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error",
+                 413: "request_too_large", 429: "rate_limit_error", 503: "overloaded_error"}.get(r.status, "api_error")
+        return fail(r.status, etype, str(msg))
     msg, err = to_message(d, obj)
     if err:
         return fail(*err)

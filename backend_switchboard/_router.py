@@ -289,10 +289,12 @@ class Handler(BaseHTTPRequestHandler):
                     body = json.dumps(obj).encode()
             if backend == "asksage":
                 status = asksage.handle(self, self.cfg, obj)
-            elif backend == "copilot" and copilot.endpoint(self.cfg, up_model, extra["authorization"][7:]) != "messages":
-                status = copilot.handle(self, self.cfg, obj, extra["authorization"][7:], up_model)
             else:
-                status = self._forward(url, extra, drop_auth, body, backend)
+                kind = copilot.endpoint(self.cfg, up_model, extra["authorization"][7:]) if backend == "copilot" else None
+                if kind and kind != "messages":
+                    status = copilot.handle(self, self.cfg, obj, extra["authorization"][7:], up_model, kind)
+                else:
+                    status = self._forward(url, extra, drop_auth, body, backend)
         except RouteError as e:
             status = e.status
             self._err(e.status, e.message)
