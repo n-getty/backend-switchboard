@@ -14,6 +14,7 @@ os.environ["BACKEND_SWITCHBOARD_HOME"] = tmp
 os.environ["AMSC_TOKEN"] = "MAGTOKEN"
 os.environ["ALCF_INFERENCE_TOKEN"] = "ALCFTOKEN"
 os.environ["ASKSAGE_API_KEY"] = "ASKTOKEN"
+os.environ["COPILOT_GITHUB_TOKEN"] = "GHTOKEN"
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import backend_switchboard._router as cr  # noqa: E402
 
@@ -29,6 +30,16 @@ def mock(name):
             raw = self.rfile.read(int(self.headers.get("content-length", 0)))
             body = json.loads(raw)
             SEEN[name] = {"path": self.path, "h": {k.lower(): v for k, v in self.headers.items()}, "raw": raw, "body": body}
+            if self.path == "/responses":
+                out = json.dumps({"id": "resp_abc", "status": "completed", "usage": {"input_tokens": 7, "output_tokens": 3},
+                                  "output": [{"type": "reasoning", "summary": []},
+                                             {"type": "message", "content": [{"type": "output_text", "text": "OK"}]}] +
+                                  ([{"type": "function_call", "call_id": "c9", "name": "get_time", "arguments": "{\"tz\": \"UTC\"}"}]
+                                   if body.get("tools") else [])}).encode()
+                self.send_response(200)
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                return self.wfile.write(out)
             if self.path.endswith("/query"):
                 out = json.dumps({"message": "\n\nhello", "tool_calls": [{"id": "c1", "type": "function", "function": {
                     "name": "get_time", "arguments": "{\"tz\": \"UTC\"}"}}] if body.get("tools") else None}).encode()
@@ -55,13 +66,13 @@ def mock(name):
     return "http://127.0.0.1:%d" % srv.server_address[1]
 
 
-urls = {n: mock(n) for n in ("anthropic", "mag", "argo", "alcf", "asksage")}
+urls = {n: mock(n) for n in ("anthropic", "mag", "argo", "alcf", "asksage", "copilot")}
 argo_settings = os.path.join(tmp, "argo_settings.json")
 json.dump({"apiKeyHelper": "echo 'ARGOTOKEN'", "env": {"ANTHROPIC_BASE_URL": urls["argo"] + "/argoapi"}},
           open(argo_settings, "w"))
 json.dump({"port": 0, "anthropic_url": urls["anthropic"], "mag_url": urls["mag"],
            "argo_settings": argo_settings, "alcf_url": urls["alcf"],
-           "asksage_url": urls["asksage"]},
+           "asksage_url": urls["asksage"], "copilot_url": urls["copilot"]},
           open(os.path.join(tmp, "config.json"), "w"))
 cr.cmd_init(cr.load_config())
 KEY = cr.read_key()
@@ -138,12 +149,35 @@ check("@asksage: tool call comes back as an Anthropic SSE tool_use stream",
 st, out, _, _ = post("gpt-4.1@asksage", extra={"messages": [{"role": "user", "content": "hi"}]})
 check("@asksage: plain answer as a non-streaming message", st == 200 and json.loads(out)["content"][0]["text"] == "hello" and json.loads(out)["stop_reason"] == "end_turn", out)
 
+post("claude-opus-5-5@copilot")
+c = SEEN["copilot"]
+check("@copilot (Claude): native /v1/messages, dotted name, gh token + Copilot headers, client auth dropped",
+      c["path"] == "/v1/messages" and c["body"]["model"] == "claude-opus-5.5" and c["h"].get("authorization") == "Bearer GHTOKEN"
+      and c["h"].get("copilot-integration-id") == "copilot-developer-cli" and c["h"].get("user-agent", "").startswith("GitHubCopilot/"))
+cop = {"system": "SYS", "tools": asktools, "max_tokens": 99,
+       "messages": [{"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}, {"type": "text", "text": "ok"},
+                                                      {"type": "tool_use", "id": "t1", "name": "get_time", "input": {"tz": "UTC"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "12:00"}, {"type": "text", "text": "thanks"}]}]}
+st, out, _, _ = post("gpt-6.1-sol@copilot", extra=dict(cop, stream=True))
+c = SEEN["copilot"]
+check("@copilot (gpt): /responses with instructions, function_call / function_call_output items, tools",
+      c["path"] == "/responses" and c["body"]["instructions"] == "SYS" and c["body"]["max_output_tokens"] == 99
+      and c["body"]["tools"][0]["name"] == "get_time" and c["body"]["stream"] is False
+      and [i.get("type") or i["role"] for i in c["body"]["input"]] == ["user", "assistant", "function_call", "function_call_output", "user"]
+      and c["body"]["input"][3] == {"type": "function_call_output", "call_id": "t1", "output": "12:00"}, str(c["body"]))
+check("@copilot (gpt): result comes back as an Anthropic SSE stream with a tool_use",
+      st == 200 and b"message_stop" in out and b'"stop_reason": "tool_use"' in out and b'"name": "get_time"' in out, out[-300:])
+st, out, _, _ = post("gpt-6.1-sol@copilot", extra={"messages": [{"role": "user", "content": "hi"}]})
+check("@copilot (gpt): plain answer as a message", st == 200 and json.loads(out)["content"][0]["text"] == "OK"
+      and json.loads(out)["stop_reason"] == "end_turn", out)
+
 ts = {"tools": [{"name": "Read", "input_schema": {}}, {"name": "DeferredToolPlaceholder", "defer_loading": True, "input_schema": {}}],
       "messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
                                                  "content": [{"type": "tool_reference", "tool_name": "WebFetch"}]}]}]}
 _, _, _, raw_ts = post("claude-opus-5-5", extra=ts)
 check("tool search: subscription route left byte-identical", SEEN["anthropic"]["raw"] == raw_ts)
-for tag in ("mag", "argo", "alcf"):
+for tag in ("mag", "argo", "alcf", "copilot"):
     post("claude-x@" + tag, extra=ts)
     b = SEEN[tag]["body"]
     check("tool search flattened for @" + tag,
@@ -154,7 +188,7 @@ for tag in ("mag", "argo", "alcf"):
 ext = {"messages": [{"role": "user", "output_config": {"x": 1}, "content": [{"type": "text", "text": "hi"}, {"type": "tool_addition", "tools": ["A"]}]}]}
 _, _, _, raw_ext = post("claude-opus-5-5", extra=ext)
 check("extensions: subscription route left byte-identical", SEEN["anthropic"]["raw"] == raw_ext)
-for tag in ("mag", "argo", "alcf"):
+for tag in ("mag", "argo", "alcf", "copilot"):
     post("claude-x@" + tag, extra=ext)
     m0 = SEEN[tag]["body"]["messages"][0]
     check("extensions stripped for @" + tag, set(m0) == {"role", "content"} and [b["type"] for b in m0["content"]] == ["text"])

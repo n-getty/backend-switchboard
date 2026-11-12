@@ -9,6 +9,7 @@ One local endpoint that lets Claude Code switch between several model backends w
 | `claude-opus-5-5@google@mag` | A LiteLLM-style gateway with Bearer auth (AMSC "MAG"); the tag `@mag` is stripped and `@google` is MAG's own suffix |
 | `beam@alcf`, `muse@alcf` | ALCF inference endpoints, which serve the Anthropic Messages API natively |
 | `google-claude-opus-5@asksage` | AskSage models, translated in-process to AskSage's `/query` API |
+| `claude-opus-5-5@copilot`, `gpt-6.1-sol@copilot` | GitHub Copilot, using your `gh` login: Claude models natively, GPT/Grok models translated to `/responses` |
 
 Claude Code only accepts one `ANTHROPIC_BASE_URL` per session, so the switch has to happen behind that URL.
 backend-switchboard is that URL. It reads the model name, picks a backend, swaps in that backend's credentials, and
@@ -22,6 +23,8 @@ Claude Code --> 127.0.0.1:8790 (backend-switchboard) --+--> api.anthropic.com   
    /model name[@tag]                                   +--> argo-shim                (@argo)
                                                        +--> MAG                      (@mag)
                                                        +--> ALCF Minerva             (@alcf)
+                                                       +--> AskSage                  (@asksage)
+                                                       +--> GitHub Copilot           (@copilot)
 ```
 
 ## Install
@@ -90,6 +93,21 @@ tool calls and their results are written into the history as prose, and answers 
 Claude models on AskSage handle the full tool loop (Read, ToolSearch, Bash); weaker ones (`gpt-4.1`) often stall on
 deferred tools. Token counts are estimates, and some AskSage models return `model_error` while their upstream is down.
 
+**GitHub Copilot (`@copilot`).** Log in once with `gh auth login` (the account needs a Copilot seat). The router runs
+`gh auth token` (cached two minutes), or uses `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` if set, and sends
+the Copilot client headers. It asks `/models` which endpoint each model supports (cached ten minutes):
+
+- Claude models serve the Anthropic Messages API, so requests are forwarded as they are, with streaming. Claude Code's
+  dashed names are mapped to Copilot's dotted ones: `claude-opus-5-5@copilot` becomes `claude-opus-5.5`.
+- `gpt-*`, `grok-*` and `mai-*` models only offer OpenAI's `/responses`. The router translates to it in process, including
+  tool calls and tool results. Answers are requested whole and streaming is emulated, and token counts for
+  `count_tokens` are estimates. Reasoning content is not carried across turns.
+- `gemini-*` models only offer `/chat/completions` and are rejected with a 400.
+
+To list your models, GET `https://api.githubcopilot.com/models` with `Authorization: Bearer $(gh auth token)`,
+`User-Agent: GitHubCopilot/1.0.105` and `Copilot-Integration-Id: copilot-developer-cli` headers.
+Add short names under `aliases.copilot` in `config.json`.
+
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
 ## Tool search
@@ -114,8 +132,9 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `mag_url` | the AMSC MAG host | `@mag` route |
 | `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
 | `asksage_url` / `asksage_cert` | `https://api.asksage.anl.gov/server` / none | AskSage server and optional extra CA bundle |
+| `copilot_url` | `https://api.githubcopilot.com` | `@copilot` route |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
-| `aliases` | `beam`, `muse` | short names per backend |
+| `aliases` | `beam`, `muse` | short names per backend (`alcf`, `copilot`) |
 
 ## Security
 

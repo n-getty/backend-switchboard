@@ -6,6 +6,7 @@
   claude-opus-5-5@argo         -> Argo via argo-shim
   beam@alcf / muse@alcf        -> ALCF Minerva (serves the Anthropic Messages API natively; Bearer token)
   gpt-5.4@asksage              -> AskSage /query (translated in-process; needs ASKSAGE_API_KEY)
+  claude-opus-5-5@copilot      -> GitHub Copilot (Claude: native; gpt-*/grok-*: /responses, translated; uses `gh auth token`)
 
 Standard library only (3.8+). Upstream credentials are read per request and never logged.
 """
@@ -27,10 +28,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from . import _asksage as asksage
+from . import _copilot as copilot
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("BACKEND_SWITCHBOARD_HOME", os.path.join(HOME, ".backend-switchboard"))
-BACKENDS = ("anthropic", "argo", "mag", "alcf", "asksage")
+BACKENDS = ("anthropic", "argo", "mag", "alcf", "asksage", "copilot")
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
        "transfer-encoding", "upgrade", "host", "content-length"}
 SOFT_ERRORS = (b"ACCESS REVOKED", b"IMPORTANT USAGE NOTICE")
@@ -45,6 +47,7 @@ DEFAULTS = {
     "alcf_url": "https://inference-api.alcf.anl.gov/resource_server/minerva/api",
     "asksage_url": "https://api.asksage.anl.gov/server",
     "asksage_cert": None,  # extra CA bundle (ANL's AskSage cert), e.g. ~/.config/asksage_proxy/asksage_anl_gov.pem
+    "copilot_url": "https://api.githubcopilot.com",
     "aliases": {"alcf": {"beam": "beam-1.0-bf16", "muse": "muse-spark-bf16"}},
 }
 
@@ -157,6 +160,12 @@ def resolve(cfg, model):
         return url, {"x-api-key": tok}, True, base, tag
     if tag == "asksage":
         return cfg["asksage_url"], {}, True, base, tag
+    if tag == "copilot":
+        tok = copilot.token()
+        if not tok:
+            raise RouteError(401, "no GitHub token; run in your own terminal: gh auth login (or set COPILOT_GITHUB_TOKEN)")
+        return (cfg["copilot_url"], dict(copilot.HEADERS, authorization="Bearer " + tok), True,
+                cfg["aliases"].get("copilot", {}).get(base, copilot.upstream_name(base)), tag)
     tok = alcf_token()
     if not tok:
         raise RouteError(401, "no ALCF token; run in your own terminal: alcf-tokens login inference")
@@ -280,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
                     body = json.dumps(obj).encode()
             if backend == "asksage":
                 status = asksage.handle(self, self.cfg, obj)
+            elif backend == "copilot" and copilot.endpoint(self.cfg, up_model, extra["authorization"][7:]) != "messages":
+                status = copilot.handle(self, self.cfg, obj, extra["authorization"][7:], up_model)
             else:
                 status = self._forward(url, extra, drop_auth, body, backend)
         except RouteError as e:
@@ -375,7 +386,7 @@ def cmd_init(cfg, quiet=False):
         json.dump(settings, f, indent=2)
     if not quiet:
         print("wrote", kp, "and", sp)
-        print("launch Claude Code with:  backend-switchboard run   (then /model <name>[@argo|@mag|@alcf|@asksage])")
+        print("launch Claude Code with:  backend-switchboard run   (then /model <name>[@argo|@mag|@alcf|@asksage|@copilot])")
 
 
 def cmd_ensure(cfg):
