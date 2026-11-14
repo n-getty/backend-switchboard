@@ -72,6 +72,7 @@ json.dump({"apiKeyHelper": "echo 'ARGOTOKEN'", "env": {"ANTHROPIC_BASE_URL": url
           open(argo_settings, "w"))
 json.dump({"port": 0, "anthropic_url": urls["anthropic"], "mag_url": urls["mag"],
            "argo_settings": argo_settings, "alcf_url": urls["alcf"],
+           "aliases": {"alcf": {"beam": {"model": "beam-1.0-fp8", "url": urls["alcf"]}, "muse": "muse-spark-bf16"}},
            "asksage_url": urls["asksage"], "copilot_url": urls["copilot"]},
           open(os.path.join(tmp, "config.json"), "w"))
 cr.cmd_init(cr.load_config())
@@ -126,8 +127,11 @@ check("@argo: client OAuth not forwarded", "authorization" not in g["h"])
 
 post("beam@alcf")
 l = SEEN["alcf"]
-check("@alcf: alias beam -> beam-1.0-bf16, Bearer ALCF token, client auth dropped",
-      l["body"]["model"] == "beam-1.0-bf16" and l["h"].get("authorization") == "Bearer ALCFTOKEN" and "x-api-key" not in l["h"])
+check("@alcf: alias beam -> beam-1.0-fp8 (own cluster url), Bearer ALCF token, client auth dropped",
+      l["body"]["model"] == "beam-1.0-fp8" and l["h"].get("authorization") == "Bearer ALCFTOKEN" and "x-api-key" not in l["h"])
+post("muse@alcf")
+check("@alcf: plain-string alias still uses alcf_url", SEEN["alcf"]["body"]["model"] == "muse-spark-bf16")
+check("default beam alias targets the tara cluster", cr.DEFAULTS["aliases"]["alcf"]["beam"]["url"].endswith("/tara/api"))
 check("@alcf: path is /v1/messages (native, no translation)", l["path"] == "/v1/messages")
 post("some-new-model@alcf")
 check("@alcf: unknown names pass through", SEEN["alcf"]["body"]["model"] == "some-new-model")
@@ -242,7 +246,13 @@ json.dump({"env": {"CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"}, "apiKeyHelper": "ech
 check("settings_conflicts: skip-auth + argo apiKeyHelper both reported", len(cr.settings_conflicts(cfg0)) == 2)
 json.dump({"apiKeyHelper": "echo sk-ant-real"}, open(os.path.join(cdir, "settings.json"), "w"))
 check("settings_conflicts: unrelated apiKeyHelper is left alone", cr.settings_conflicts(cfg0) == [])
+json.dump({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:20098/argoapi"}}, open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: leftover ANTHROPIC_BASE_URL reported", len(cr.settings_conflicts(cfg0)) == 1)
 del os.environ["CLAUDE_CONFIG_DIR"]
+cfgm = dict(cr.load_config(), models=["beam@alcf", {"model": "x@argo", "label": "X"}, {"label": "no model"}])
+cr.cmd_init(cfgm, quiet=True)
+opts = json.load(open(os.path.join(cr.DIR, "settings.json")))["modelPicker"]["options"]
+check("init: models become modelPicker rows", opts == [{"model": "beam@alcf", "label": "beam@alcf"}, {"model": "x@argo", "label": "X"}])
 
 print("\n%d failure(s)" % len(fails))
 sys.stdout.flush()
