@@ -60,6 +60,21 @@ local URL from `~/.claude/settings.json` on every request (change the path with 
 exhausted quota with HTTP 200 and an "ACCESS REVOKED" notice, the router turns that into a 429 so it is not shown as a
 model answer.
 
+### Coming from an Argo-only setup
+
+If your Claude Code was already pointed at argo-shim (`ANTHROPIC_BASE_URL`, an `apiKeyHelper`, and
+`CLAUDE_CODE_SKIP_ANTHROPIC_AUTH=1` in `~/.claude/settings.json`), those settings stop your Anthropic subscription
+from working through the switchboard: Claude Code skips your login and sends the shim key to Anthropic. `run` prints a
+warning when it sees this. One-time fix, so a single `~/.claude` serves every backend:
+
+1. Put the shim details where only the router reads them, in `~/.backend-switchboard/config.json`:
+   `{"argo_url": "http://127.0.0.1:<port>/argoapi", "argo_token": "<shim token>"}` (or export `ARGO_SHIM_URL` and
+   `ARGO_SHIM_TOKEN` in the shell that starts the router).
+2. Remove `ANTHROPIC_BASE_URL`, `apiKeyHelper` and `CLAUDE_CODE_SKIP_ANTHROPIC_AUTH` from `~/.claude/settings.json`.
+3. Run `backend-switchboard run` and `/login` once to use your subscription.
+
+You no longer need a second config directory or a per-backend alias.
+
 **MAG (`@mag`).** Export `AMSC_TOKEN` in the environment the router starts from. Set `mag_url` in `config.json` to
 point at another Bearer-auth gateway. MAG's own provider suffixes stay in the name: `claude-opus-5-5@google@mag`.
 
@@ -130,7 +145,8 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `tool_search` | `true` | value written to `ENABLE_TOOL_SEARCH` in the generated Claude Code settings |
 | `anthropic_url` | `https://api.anthropic.com` | no-tag route |
 | `mag_url` | the AMSC MAG host | `@mag` route |
-| `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
+| `argo_url` / `argo_token` | `$ARGO_SHIM_URL` / `$ARGO_SHIM_TOKEN`, else read from `argo_settings` | argo-shim base URL (include `/argoapi`) and client token |
+| `argo_settings` | `~/.claude/settings.json` | fallback file with `apiKeyHelper` and `env.ANTHROPIC_BASE_URL` |
 | `asksage_url` / `asksage_cert` | `https://api.asksage.anl.gov/server` / none | AskSage server and optional extra CA bundle |
 | `copilot_url` | `https://api.githubcopilot.com` | `@copilot` route |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |

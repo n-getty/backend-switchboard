@@ -218,6 +218,32 @@ c.request("POST", "/v1/messages", json.dumps({"model": "revoked@argo", "messages
 r = c.getresponse()
 check("argo soft error (HTTP 200 + ACCESS REVOKED) -> 429", r.status == 429)
 
+# argo credentials without any settings file: config.json values, then env
+none_cfg = dict(cr.load_config(), argo_settings=os.path.join(tmp, "missing.json"))
+os.environ.pop("ARGO_SHIM_TOKEN", None)
+os.environ.pop("ARGO_SHIM_URL", None)
+check("argo_creds: nothing configured -> (None, None)", cr.argo_creds(none_cfg) == (None, None))
+os.environ["ARGO_SHIM_TOKEN"], os.environ["ARGO_SHIM_URL"] = "ENVTOK", "http://127.0.0.1:1/argoapi"
+check("argo_creds: env fallback", cr.argo_creds(none_cfg) == ("ENVTOK", "http://127.0.0.1:1/argoapi"))
+check("argo_creds: config.json beats env",
+      cr.argo_creds(dict(none_cfg, argo_token="CFGTOK", argo_url="http://127.0.0.1:2/argoapi"))
+      == ("CFGTOK", "http://127.0.0.1:2/argoapi"))
+check("argo_creds: settings file beats env token", cr.argo_creds(cr.load_config())[0] == "ARGOTOKEN")
+del os.environ["ARGO_SHIM_TOKEN"], os.environ["ARGO_SHIM_URL"]
+
+# Argo-only Claude Code settings are detected (and an unrelated apiKeyHelper is not)
+cdir = os.path.join(tmp, "claude_conf")
+os.makedirs(cdir)
+os.environ["CLAUDE_CONFIG_DIR"] = cdir
+os.environ.pop("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", None)  # the developer's own shell may set it
+cfg0 = cr.load_config()
+json.dump({"env": {"CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"}, "apiKeyHelper": "echo ARGOTOKEN"},
+          open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: skip-auth + argo apiKeyHelper both reported", len(cr.settings_conflicts(cfg0)) == 2)
+json.dump({"apiKeyHelper": "echo sk-ant-real"}, open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: unrelated apiKeyHelper is left alone", cr.settings_conflicts(cfg0) == [])
+del os.environ["CLAUDE_CONFIG_DIR"]
+
 print("\n%d failure(s)" % len(fails))
 sys.stdout.flush()
 sys.stderr.flush()

@@ -43,7 +43,8 @@ DEFAULTS = {
     "anthropic_url": "https://api.anthropic.com",
     "mag_url": "https://mag.genesis.americansciencecloud.org",
     "argo_settings": os.path.join(HOME, ".claude", "settings.json"),
-    "argo_url": None,
+    "argo_url": None,    # e.g. http://127.0.0.1:20098/argoapi (else $ARGO_SHIM_URL, else read from argo_settings)
+    "argo_token": None,  # else argo_settings' apiKeyHelper, else $ARGO_SHIM_TOKEN
     "alcf_url": "https://inference-api.alcf.anl.gov/resource_server/minerva/api",
     "asksage_url": "https://api.asksage.anl.gov/server",
     "asksage_cert": None,  # extra CA bundle (ANL's AskSage cert), e.g. ~/.config/asksage_proxy/asksage_anl_gov.pem
@@ -113,6 +114,16 @@ def _argo_base(path):
     return url if urlsplit(url).hostname in ("127.0.0.1", "localhost") else None
 
 
+def argo_creds(cfg):
+    """(token, base URL) for argo-shim. Explicit config wins; then the settings file (re-read on change, so a rotated
+    token is picked up); then the environment. Nothing needs to live in Claude Code's own settings."""
+    tok = (cfg.get("argo_token") or cached_file(cfg["argo_settings"], _argo_token)
+           or os.environ.get("ARGO_SHIM_TOKEN"))
+    url = (cfg.get("argo_url") or os.environ.get("ARGO_SHIM_URL")
+           or cached_file(cfg["argo_settings"], _argo_base))
+    return tok, url
+
+
 def mag_token():
     return os.environ.get("AMSC_TOKEN")
 
@@ -153,10 +164,10 @@ def resolve(cfg, model):
             raise RouteError(401, "AMSC_TOKEN is not set in the router's environment (restart it after exporting)")
         return cfg["mag_url"], {"authorization": "Bearer " + tok}, True, base, tag
     if tag == "argo":
-        tok = cached_file(cfg["argo_settings"], _argo_token)
-        url = cfg["argo_url"] or cached_file(cfg["argo_settings"], _argo_base)
+        tok, url = argo_creds(cfg)
         if not tok or not url:
-            raise RouteError(502, "cannot read argo-shim token/base URL from %s" % cfg["argo_settings"])
+            raise RouteError(502, "no argo-shim token/URL: set argo_url and argo_token in config.json (or "
+                                  "ARGO_SHIM_URL / ARGO_SHIM_TOKEN), or point argo_settings at a file with them")
         return url, {"x-api-key": tok}, True, base, tag
     if tag == "asksage":
         return cfg["asksage_url"], {}, True, base, tag
@@ -406,8 +417,35 @@ def cmd_ensure(cfg):
     sys.exit("backend-switchboard failed to start; see %s/router.log" % DIR)
 
 
+def settings_conflicts(cfg):
+    """Claude Code settings that make the plain-Anthropic (subscription) route fail: left over from an Argo-only setup."""
+    cdir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    try:
+        with open(os.path.join(cdir, "settings.json")) as f:
+            user = json.load(f)
+    except (OSError, ValueError):
+        user = {}
+    env = dict(user.get("env", {}))
+    env.update({k: v for k, v in os.environ.items() if k == "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH"})
+    found = []
+    if str(env.get("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", "")).lower() in ("1", "true", "yes"):
+        found.append("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH is set, so Claude Code skips your Anthropic login")
+    helper = user.get("apiKeyHelper")
+    words = shlex.split(helper) if isinstance(helper, str) and helper.strip() else []
+    argo_tok = argo_creds(cfg)[0]
+    if words and argo_tok and words[-1] == argo_tok:
+        found.append("apiKeyHelper in %s sends the argo-shim key on every request" % os.path.join(cdir, "settings.json"))
+    return found
+
+
 def cmd_run(cfg, args):
     cmd_init(cfg, quiet=True)  # keeps settings.json in sync with config.json (port)
+    problems = settings_conflicts(cfg)
+    if problems:
+        sys.stderr.write("backend-switchboard: warning: untagged models (your subscription) will fail:\n"
+                         + "".join("  - %s\n" % p for p in problems)
+                         + "  Move the Argo setup into ~/.backend-switchboard/config.json (argo_url, argo_token) and remove\n"
+                           "  these from Claude Code's settings.json. See README: \"Coming from an Argo-only setup\".\n")
     cmd_ensure(cfg)
     if shutil.which("claude") is None:
         sys.exit("claude not found on PATH; install Claude Code first")
