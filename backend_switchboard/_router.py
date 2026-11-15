@@ -214,7 +214,8 @@ def strip_client_extensions(obj):
     than role/content (e.g. output_config) and content blocks of unknown type (e.g. tool_addition).
     Returns True if anything changed."""
     changed = False
-    for msg in obj.get("messages", []):
+    msgs = obj.get("messages", [])
+    for msg in msgs:
         if not isinstance(msg, dict):
             continue
         for k in [k for k in msg if k not in ("role", "content")]:
@@ -226,6 +227,13 @@ def strip_client_extensions(obj):
             if len(kept) != len(content):
                 msg["content"] = kept
                 changed = True
+    # A message whose only blocks were stripped (e.g. a mid-conversation role "system" message carrying a block type
+    # Argo does not know) would reach Vertex empty and be rejected: "messages.N: system content must contain at least
+    # one block". Drop such messages; neighbours of the same role are merged by the API.
+    live = [m for m in msgs if not (isinstance(m, dict) and m.get("content") == [])]
+    if len(live) != len(msgs):
+        obj["messages"] = live
+        changed = True
     return changed
 
 
