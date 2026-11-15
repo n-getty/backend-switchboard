@@ -49,7 +49,16 @@ DEFAULTS = {
     "asksage_url": "https://api.asksage.anl.gov/server",
     "asksage_cert": None,  # extra CA bundle (ANL's AskSage cert), e.g. ~/.config/asksage_proxy/asksage_anl_gov.pem
     "copilot_url": "https://api.githubcopilot.com",
-    "models": [],  # extra /model picker rows: "name@tag" or {"model": ..., "label": ..., "description": ...}
+    # /model picker rows: "name@tag" or {"model": ..., "label": ..., "description": ...}. Setting "models" in config.json
+    # replaces this list ([] shows none).
+    "models": [
+        {"model": "claude-sonnet-5-5@argo", "label": "Sonnet 5.5 (Argo)"},
+        {"model": "claude-opus-5-5@google@mag", "label": "Opus 5.5 (MAG)"},
+        {"model": "beam@alcf", "label": "Beam (ALCF)"},
+        {"model": "muse@alcf", "label": "Muse (ALCF)"},
+        {"model": "google-claude-opus-5@asksage", "label": "Claude Opus 5 (AskSage)"},
+        {"model": "claude-opus-5-5@copilot", "label": "Opus 5.5 (Copilot)"},
+    ],
     # an alias is a model name, or {"model": ..., "url": ...} when the model lives on another ALCF cluster
     "aliases": {"alcf": {"beam": {"model": "beam-1.0-fp8", "url": "https://inference-api.alcf.anl.gov/resource_server/tara/api"},
                          "muse": "muse-spark-bf16"}},

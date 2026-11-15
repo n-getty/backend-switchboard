@@ -276,6 +276,8 @@ check("migrate: settings clean afterwards", cr.settings_conflicts(cr.load_config
 cr.cmd_migrate(cr.load_config(), yes=True)  # second run is a no-op
 check("migrate: idempotent", json.load(open(sj)) == after)
 del os.environ["CLAUDE_CONFIG_DIR"]
+check("default picker rows cover every backend", {m["model"].rsplit("@", 1)[1] for m in cr.DEFAULTS["models"]}
+      == set(cr.BACKENDS) - {"anthropic"})
 cfgm = dict(cr.load_config(), models=["beam@alcf", {"model": "x@argo", "label": "X"}, {"label": "no model"}])
 cr.cmd_init(cfgm, quiet=True)
 opts = json.load(open(os.path.join(cr.DIR, "settings.json")))["modelPicker"]["options"]
