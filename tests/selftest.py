@@ -216,6 +216,15 @@ m, _ = _ask.to_message({"message": "Done. [tool_use functions.get_time id=x] {\"
 check("@asksage: tool call written as text is recovered (known tools only)",
       [b["type"] for b in m["content"]] == ["text", "tool_use"] and m["content"][1]["input"] == {"tz": "UTC"}
       and m["stop_reason"] == "tool_use" and "[tool_use nope]" in m["content"][0]["text"], str(m))
+prose = ('Creating a worktree:\n\n(Earlier in this conversation I used the get_time tool with input {"tz": "a}b\\n"}.)\n\n'
+         '(Result of that tool call:)\nmade up output')
+m, _ = _ask.to_message({"message": prose}, {"model": "m", "tools": asktools}, {"message": ""})
+check("@asksage: prose-notation tool call recovered, invented result dropped",
+      [b["type"] for b in m["content"]] == ["text", "tool_use"] and m["content"][1]["input"] == {"tz": "a}b\n"}
+      and m["content"][0]["text"] == "Creating a worktree:" and m["stop_reason"] == "tool_use", str(m))
+m, _ = _ask.to_message({"message": "(Earlier in this conversation I used the nope tool with input {}.)"},
+                       {"model": "m", "tools": asktools}, {"message": ""})
+check("@asksage: prose notation for an unknown tool stays text", m["stop_reason"] == "end_turn")
 post("claude-x@asksage", extra=ts)
 check("tool search flattened for @asksage", [t["function"]["name"] for t in SEEN["asksage"]["body"]["tools"]] == ["Read"]
       and "Tool loaded: WebFetch" in SEEN["asksage"]["body"]["message"][-1]["message"])
