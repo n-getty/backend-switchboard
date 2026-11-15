@@ -7,6 +7,7 @@ results travel through the history as text turns; the model still sees the real 
 import http.client
 import json
 import os
+import re
 import ssl
 import time
 import uuid
@@ -74,33 +75,61 @@ def _tokens(x):
     return max(1, len(x if isinstance(x, str) else json.dumps(x)) // 4)
 
 
+_PROSE = re.compile(r"\(Earlier in this conversation I used the (\S+) tool with input ")
+_RESULT = "(Result of that tool call"
+
+
 def _mimicked_calls(text, names):
-    """Models sometimes copy the history's "[tool_use NAME id=..] {json}" notation instead of making a real call.
-    Recover those as tool_use blocks (known tool names only); return (remaining text, blocks)."""
+    """Models sometimes copy the history's notation instead of making a real call, either "[tool_use NAME id=..] {json}"
+    or "(Earlier in this conversation I used the NAME tool with input {json}.)" (what _render writes today). Recover
+    those as tool_use blocks (known tool names only); anything the model then invents as that call's result is dropped.
+    Return (remaining text, blocks)."""
     dec, blocks, out, i = json.JSONDecoder(), [], [], 0
+
+    def args_at(pos):  # (dict, end) for a JSON object starting at/after pos; ({}, pos) if there is none
+        rest = text[pos:]
+        lead = len(rest) - len(rest.lstrip())
+        try:
+            val, n = dec.raw_decode(rest[lead:])
+        except ValueError:
+            return {}, pos
+        return (val, pos + lead + n) if isinstance(val, dict) else ({}, pos)
+
     while True:
-        j = text.find("[tool_use ", i)
-        k = text.find("]", j) if j >= 0 else -1
-        if k < 0:
+        j1 = text.find("[tool_use ", i)
+        m = _PROSE.search(text, i)
+        j2 = m.start() if m else -1
+        if j1 < 0 and j2 < 0:
             out.append(text[i:])
             break
-        head = text[j + 10:k].split()
-        name = (head[0] if head else "").split("functions.")[-1]
-        if name not in names:
-            out.append(text[i:k + 1])
-            i = k + 1
-            continue
-        args, end = {}, k + 1
-        try:
-            rest = text[k + 1:]
-            val, n = dec.raw_decode(rest.lstrip())
-            if isinstance(val, dict):
-                args, end = val, k + 1 + (len(rest) - len(rest.lstrip())) + n
-        except ValueError:
-            pass
-        out.append(text[i:j])
+        if j2 >= 0 and (j1 < 0 or j2 < j1):  # prose form is next
+            name = m.group(1).split("functions.")[-1]
+            if name not in names:
+                out.append(text[i:m.end()])
+                i = m.end()
+                continue
+            args, end = args_at(m.end())
+            if end > m.end() and text[end:end + 2] == ".)":
+                end += 2
+            out.append(text[i:j2])
+        else:  # "[tool_use NAME ...]" form is next
+            k = text.find("]", j1)
+            if k < 0:
+                out.append(text[i:])
+                break
+            head = text[j1 + 10:k].split()
+            name = (head[0] if head else "").split("functions.")[-1]
+            if name not in names:
+                out.append(text[i:k + 1])
+                i = k + 1
+                continue
+            args, end = args_at(k + 1)
+            end = max(end, k + 1)
+            out.append(text[i:j1])
         blocks.append({"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:24], "name": name, "input": args})
         i = end
+        if text[i:].lstrip().startswith(_RESULT):  # the model made up the result too: it will get the real one
+            break
     return "".join(out).strip(), blocks
 
 
@@ -128,7 +157,7 @@ def to_message(d, req, q):
             content.append({"type": "tool_use", "id": str(c.get("id") or "toolu_" + uuid.uuid4().hex[:24]),
                             "name": fn["name"], "input": args if isinstance(args, dict) else {}})
     names = {t["name"] for t in req.get("tools") or [] if isinstance(t, dict) and t.get("name")}
-    if "[tool_use " in text and not any(b["type"] == "tool_use" for b in content):
+    if ("[tool_use " in text or "(Earlier in this conversation" in text) and not any(b["type"] == "tool_use" for b in content):
         text, found = _mimicked_calls(text, names)
         content = ([{"type": "text", "text": text}] if text else []) + found
     tool = any(b["type"] == "tool_use" for b in content)
