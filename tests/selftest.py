@@ -249,6 +249,15 @@ check("settings_conflicts: unrelated apiKeyHelper is left alone", cr.settings_co
 json.dump({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:20098/argoapi"}}, open(os.path.join(cdir, "settings.json"), "w"))
 check("settings_conflicts: leftover ANTHROPIC_BASE_URL reported", len(cr.settings_conflicts(cfg0)) == 1)
 del os.environ["CLAUDE_CONFIG_DIR"]
+# a running router sees argo creds written to config.json after it started
+cdir2 = os.path.join(tmp, "cd2"); os.makedirs(cdir2)
+bare = dict(cr.load_config(), argo_token=None, argo_url=None, argo_settings=os.path.join(cdir2, "none.json"))
+os.environ.pop("ARGO_SHIM_TOKEN", None); os.environ.pop("ARGO_SHIM_URL", None)
+cpath = os.path.join(cr.DIR, "config.json"); saved = open(cpath).read()
+json.dump({"argo_token": "T0"}, open(cpath, "w"))
+check("argo_creds: reads config.json written after start (no restart)", cr.argo_creds(bare)[0] == "T0")
+open(cpath, "w").write(saved)
+
 # migrate: the full Argo-only setup is moved into config.json and removed from settings.json, other keys survive
 os.environ["CLAUDE_CONFIG_DIR"] = cdir
 os.environ.pop("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", None)
