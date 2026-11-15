@@ -91,7 +91,8 @@ _cache = {}
 def cached_file(path, parse):
     """Re-parse a file only when its mtime changes (tokens rotate; settings files get rewritten)."""
     try:
-        m = os.stat(path).st_mtime
+        st = os.stat(path)
+        m = (st.st_mtime_ns, st.st_size)
     except OSError:
         return None
     key = (path, parse.__name__)
@@ -117,12 +118,19 @@ def _argo_base(path):
     return url if urlsplit(url).hostname in ("127.0.0.1", "localhost") else None
 
 
+def _config_argo(path):
+    d = json.load(open(path))
+    return d.get("argo_token"), d.get("argo_url")
+
+
 def argo_creds(cfg):
     """(token, base URL) for argo-shim. Explicit config wins; then the settings file (re-read on change, so a rotated
     token is picked up); then the environment. Nothing needs to live in Claude Code's own settings."""
-    tok = (cfg.get("argo_token") or cached_file(cfg["argo_settings"], _argo_token)
+    # config.json is re-read on change, so `migrate` (or an edit) works without restarting a running router
+    live_tok, live_url = cached_file(os.path.join(DIR, "config.json"), _config_argo) or (None, None)
+    tok = (cfg.get("argo_token") or live_tok or cached_file(cfg["argo_settings"], _argo_token)
            or os.environ.get("ARGO_SHIM_TOKEN"))
-    url = (cfg.get("argo_url") or os.environ.get("ARGO_SHIM_URL")
+    url = (cfg.get("argo_url") or live_url or os.environ.get("ARGO_SHIM_URL")
            or cached_file(cfg["argo_settings"], _argo_base))
     return tok, url
 
@@ -519,6 +527,7 @@ def cmd_migrate(cfg, yes=False):
         if "env" in user and not user["env"]:
             del user["env"]
         _write_json_600(sp, user)
+        cmd_stop()  # a running router would otherwise keep its old view of the config
         print("done: settings.json cleaned. Start Claude with `backend-switchboard run` and /login once.")
     if shell_skip:
         print("!! CLAUDE_CODE_SKIP_ANTHROPIC_AUTH is also exported in your shell, which this tool cannot change.\n"
@@ -569,6 +578,8 @@ def cmd_doctor(cfg):
 
 
 def cmd_stop():
+    if not os.path.exists(os.path.join(DIR, "router.pid")):
+        return print("not running")
     try:
         pid = int(open(os.path.join(DIR, "router.pid")).read())
         os.kill(pid, 15)
