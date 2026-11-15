@@ -201,6 +201,15 @@ for tag in ("mag", "argo", "alcf", "copilot"):
     m0 = SEEN[tag]["body"]["messages"][0]
     check("extensions stripped for @" + tag, set(m0) == {"role", "content"} and [b["type"] for b in m0["content"]] == ["text"])
 
+# a message whose only blocks are unknown (e.g. a mid-conversation role "system" message) must not reach Argo empty
+emp = {"messages": [{"role": "user", "content": "hi"},
+                    {"role": "system", "content": [{"type": "directive", "text": "x"}]},
+                    {"role": "assistant", "content": "yo"},
+                    {"role": "user", "content": [{"type": "text", "text": "go"}]}]}
+for tag in ("mag", "argo", "alcf", "copilot"):
+    post("claude-x@" + tag, extra=emp)
+    check("emptied messages dropped for @" + tag, [m["role"] for m in SEEN[tag]["body"]["messages"]] == ["user", "assistant", "user"])
+
 from backend_switchboard import _asksage as _ask  # noqa: E402
 m, _ = _ask.to_message({"message": "Done. [tool_use functions.get_time id=x] {\"tz\": \"UTC\"} bye [tool_use nope] {}"},
                        {"model": "m", "tools": asktools}, {"message": ""})
