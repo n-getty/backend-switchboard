@@ -45,11 +45,11 @@ backend-switchboard run -c           # anything after "run" is passed to claude
 Then inside Claude Code: `/model beam@alcf`, `/model claude-sonnet-5-5@argo`, `/model claude-sonnet-5-5` (back to your
 subscription). You can switch mid-conversation; the history is carried across backends.
 
-Other commands: `init` (create the key and settings), `ensure` (start the router in the background), `stop`, `serve`
+Other commands: `doctor` (checks each backend's setup and flags settings that will break your subscription), `init` (create the key and settings), `ensure` (start the router in the background), `stop`, `serve`
 (foreground). State lives in `~/.backend-switchboard/` (override with `BACKEND_SWITCHBOARD_HOME`).
 
-If you launch Claude Code with a separate config directory, e.g. a personal subscription, export `CLAUDE_CONFIG_DIR`
-first; `run` leaves it alone.
+You do not need a separate config directory or alias per backend: run `/login` once in your normal `~/.claude` and every
+backend works from the same session. (If you already use `CLAUDE_CONFIG_DIR` for a subscription, `run` leaves it alone.)
 
 ## Backends
 
@@ -59,6 +59,26 @@ first; `run` leaves it alone.
 local URL from `~/.claude/settings.json` on every request (change the path with `argo_settings`). If Argo answers an
 exhausted quota with HTTP 200 and an "ACCESS REVOKED" notice, the router turns that into a 429 so it is not shown as a
 model answer.
+
+### Coming from an Argo-only setup
+
+If your Claude Code was already pointed at argo-shim (`ANTHROPIC_BASE_URL`, an `apiKeyHelper`, and
+`CLAUDE_CODE_SKIP_ANTHROPIC_AUTH=1` in `~/.claude/settings.json`), those settings stop your Anthropic subscription
+from working through the switchboard: Claude Code skips your login and sends the shim key to Anthropic. `run` prints a
+warning when it sees this. One-time fix, so a single `~/.claude` serves every backend:
+
+**Close any running Claude Code sessions that use the Argo setup before step 2.** Claude Code re-reads
+`settings.json` while it runs, so removing `apiKeyHelper` under a live Argo session makes it fall back to your Anthropic
+login and fail midstream with "Login expired · Please run /login". Any backup of `settings.json` you make also contains
+the shim token; keep it mode 600 (or delete it).
+
+1. Put the shim details where only the router reads them, in `~/.backend-switchboard/config.json`:
+   `{"argo_url": "http://127.0.0.1:<port>/argoapi", "argo_token": "<shim token>"}` (or export `ARGO_SHIM_URL` and
+   `ARGO_SHIM_TOKEN` in the shell that starts the router).
+2. Remove `ANTHROPIC_BASE_URL`, `apiKeyHelper` and `CLAUDE_CODE_SKIP_ANTHROPIC_AUTH` from `~/.claude/settings.json`.
+3. Run `backend-switchboard doctor` to confirm, then `backend-switchboard run` and `/login` once to use your subscription.
+
+You no longer need a second config directory or a per-backend alias.
 
 **MAG (`@mag`).** Export `AMSC_TOKEN` in the environment the router starts from. Set `mag_url` in `config.json` to
 point at another Bearer-auth gateway. MAG's own provider suffixes stay in the name: `claude-opus-5-5@google@mag`.
@@ -72,13 +92,13 @@ alcf-tokens login inference
 
 The router runs `alcf-tokens get-token inference` (cached for two minutes), or uses `ALCF_INFERENCE_TOKEN` if you set it.
 ALCF's Minerva endpoint accepts the Anthropic Messages API directly with a Bearer token, so requests are forwarded as they
-are, including streaming, tool calls and the models' thinking blocks. Aliases `beam` and `muse` map to `beam-1.0-bf16`
-and `muse-spark-bf16`; any other name is passed through. Add or change aliases under `aliases.alcf` in `config.json`.
+are, including streaming, tool calls and the models' thinking blocks. Aliases `beam` and `muse` map to `beam-1.0-fp8`
+(on ALCF's `tara` cluster, which has its own URL) and `muse-spark-bf16`; any other name is passed through. Add or change aliases under `aliases.alcf` in `config.json`; a value is a model name, or `{"model": ..., "url": ...}` for a model on another cluster.
 
 **AskSage (`@asksage`).** Setup:
 
 1. Get an AskSage API key from your AskSage account settings (for ANL: https://api.asksage.anl.gov) and export it in the
-   shell that starts the router, e.g. in `~/.bashrc`: `export ASKSAGE_API_KEY=...`. The router reads it per request and
+   shell that starts the router, e.g. in `~/.bashrc`: `export ASKSAGE_API_KEY=...` (`ASKSAGE_PROXY_KEY`, the name asksage-proxy used, also works). The router reads it per request and
    never logs it. It reads only the environment, so restart the router after changing it: `backend-switchboard stop`,
    then launch again.
 2. If your AskSage host uses a private CA, save its certificate and point at it in `~/.backend-switchboard/config.json`:
@@ -110,6 +130,9 @@ Add short names under `aliases.copilot` in `config.json`.
 
 A bare `name@google` is rejected as ambiguous, because more than one backend uses that suffix. Always add a router tag.
 
+**TLS errors on every HTTPS backend** (`SSLError ... (_ssl.c:3036)`): the Python running the router rejects the system
+`openssl.cnf`. The router detects this at start-up and restarts itself with `OPENSSL_CONF=/dev/null`; `doctor` reports it.
+
 ## Tool search
 
 `init` sets `ENABLE_TOOL_SEARCH=true`, which defers most tool definitions and cuts the request size (about 37% fewer
@@ -130,10 +153,12 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `tool_search` | `true` | value written to `ENABLE_TOOL_SEARCH` in the generated Claude Code settings |
 | `anthropic_url` | `https://api.anthropic.com` | no-tag route |
 | `mag_url` | the AMSC MAG host | `@mag` route |
-| `argo_settings` / `argo_url` | `~/.claude/settings.json` / read from it | where to find argo-shim |
+| `argo_url` / `argo_token` | `$ARGO_SHIM_URL` / `$ARGO_SHIM_TOKEN`, else read from `argo_settings` | argo-shim base URL (include `/argoapi`) and client token |
+| `argo_settings` | `~/.claude/settings.json` | fallback file with `apiKeyHelper` and `env.ANTHROPIC_BASE_URL` |
 | `asksage_url` / `asksage_cert` | `https://api.asksage.anl.gov/server` / none | AskSage server and optional extra CA bundle |
 | `copilot_url` | `https://api.githubcopilot.com` | `@copilot` route |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
+| `models` | none | extra rows for `/model`: names like `"beam@alcf"` or `{"model", "label", "description"}`; written as `modelPicker` in the generated settings (Claude Code 2.1.242+) |
 | `aliases` | `beam`, `muse` | short names per backend (`alcf`, `copilot`) |
 
 ## Security

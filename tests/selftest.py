@@ -72,6 +72,7 @@ json.dump({"apiKeyHelper": "echo 'ARGOTOKEN'", "env": {"ANTHROPIC_BASE_URL": url
           open(argo_settings, "w"))
 json.dump({"port": 0, "anthropic_url": urls["anthropic"], "mag_url": urls["mag"],
            "argo_settings": argo_settings, "alcf_url": urls["alcf"],
+           "aliases": {"alcf": {"beam": {"model": "beam-1.0-fp8", "url": urls["alcf"]}, "muse": "muse-spark-bf16"}},
            "asksage_url": urls["asksage"], "copilot_url": urls["copilot"]},
           open(os.path.join(tmp, "config.json"), "w"))
 cr.cmd_init(cr.load_config())
@@ -126,8 +127,11 @@ check("@argo: client OAuth not forwarded", "authorization" not in g["h"])
 
 post("beam@alcf")
 l = SEEN["alcf"]
-check("@alcf: alias beam -> beam-1.0-bf16, Bearer ALCF token, client auth dropped",
-      l["body"]["model"] == "beam-1.0-bf16" and l["h"].get("authorization") == "Bearer ALCFTOKEN" and "x-api-key" not in l["h"])
+check("@alcf: alias beam -> beam-1.0-fp8 (own cluster url), Bearer ALCF token, client auth dropped",
+      l["body"]["model"] == "beam-1.0-fp8" and l["h"].get("authorization") == "Bearer ALCFTOKEN" and "x-api-key" not in l["h"])
+post("muse@alcf")
+check("@alcf: plain-string alias still uses alcf_url", SEEN["alcf"]["body"]["model"] == "muse-spark-bf16")
+check("default beam alias targets the tara cluster", cr.DEFAULTS["aliases"]["alcf"]["beam"]["url"].endswith("/tara/api"))
 check("@alcf: path is /v1/messages (native, no translation)", l["path"] == "/v1/messages")
 post("some-new-model@alcf")
 check("@alcf: unknown names pass through", SEEN["alcf"]["body"]["model"] == "some-new-model")
@@ -217,6 +221,38 @@ c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
 c.request("POST", "/v1/messages", json.dumps({"model": "revoked@argo", "messages": []}), {"x-router-key": KEY})
 r = c.getresponse()
 check("argo soft error (HTTP 200 + ACCESS REVOKED) -> 429", r.status == 429)
+
+# argo credentials without any settings file: config.json values, then env
+none_cfg = dict(cr.load_config(), argo_settings=os.path.join(tmp, "missing.json"))
+os.environ.pop("ARGO_SHIM_TOKEN", None)
+os.environ.pop("ARGO_SHIM_URL", None)
+check("argo_creds: nothing configured -> (None, None)", cr.argo_creds(none_cfg) == (None, None))
+os.environ["ARGO_SHIM_TOKEN"], os.environ["ARGO_SHIM_URL"] = "ENVTOK", "http://127.0.0.1:1/argoapi"
+check("argo_creds: env fallback", cr.argo_creds(none_cfg) == ("ENVTOK", "http://127.0.0.1:1/argoapi"))
+check("argo_creds: config.json beats env",
+      cr.argo_creds(dict(none_cfg, argo_token="CFGTOK", argo_url="http://127.0.0.1:2/argoapi"))
+      == ("CFGTOK", "http://127.0.0.1:2/argoapi"))
+check("argo_creds: settings file beats env token", cr.argo_creds(cr.load_config())[0] == "ARGOTOKEN")
+del os.environ["ARGO_SHIM_TOKEN"], os.environ["ARGO_SHIM_URL"]
+
+# Argo-only Claude Code settings are detected (and an unrelated apiKeyHelper is not)
+cdir = os.path.join(tmp, "claude_conf")
+os.makedirs(cdir)
+os.environ["CLAUDE_CONFIG_DIR"] = cdir
+os.environ.pop("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", None)  # the developer's own shell may set it
+cfg0 = cr.load_config()
+json.dump({"env": {"CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1"}, "apiKeyHelper": "echo ARGOTOKEN"},
+          open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: skip-auth + argo apiKeyHelper both reported", len(cr.settings_conflicts(cfg0)) == 2)
+json.dump({"apiKeyHelper": "echo sk-ant-real"}, open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: unrelated apiKeyHelper is left alone", cr.settings_conflicts(cfg0) == [])
+json.dump({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:20098/argoapi"}}, open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: leftover ANTHROPIC_BASE_URL reported", len(cr.settings_conflicts(cfg0)) == 1)
+del os.environ["CLAUDE_CONFIG_DIR"]
+cfgm = dict(cr.load_config(), models=["beam@alcf", {"model": "x@argo", "label": "X"}, {"label": "no model"}])
+cr.cmd_init(cfgm, quiet=True)
+opts = json.load(open(os.path.join(cr.DIR, "settings.json")))["modelPicker"]["options"]
+check("init: models become modelPicker rows", opts == [{"model": "beam@alcf", "label": "beam@alcf"}, {"model": "x@argo", "label": "X"}])
 
 print("\n%d failure(s)" % len(fails))
 sys.stdout.flush()

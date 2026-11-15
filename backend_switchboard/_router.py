@@ -43,12 +43,16 @@ DEFAULTS = {
     "anthropic_url": "https://api.anthropic.com",
     "mag_url": "https://mag.genesis.americansciencecloud.org",
     "argo_settings": os.path.join(HOME, ".claude", "settings.json"),
-    "argo_url": None,
+    "argo_url": None,    # e.g. http://127.0.0.1:20098/argoapi (else $ARGO_SHIM_URL, else read from argo_settings)
+    "argo_token": None,  # else argo_settings' apiKeyHelper, else $ARGO_SHIM_TOKEN
     "alcf_url": "https://inference-api.alcf.anl.gov/resource_server/minerva/api",
     "asksage_url": "https://api.asksage.anl.gov/server",
     "asksage_cert": None,  # extra CA bundle (ANL's AskSage cert), e.g. ~/.config/asksage_proxy/asksage_anl_gov.pem
     "copilot_url": "https://api.githubcopilot.com",
-    "aliases": {"alcf": {"beam": "beam-1.0-bf16", "muse": "muse-spark-bf16"}},
+    "models": [],  # extra /model picker rows: "name@tag" or {"model": ..., "label": ..., "description": ...}
+    # an alias is a model name, or {"model": ..., "url": ...} when the model lives on another ALCF cluster
+    "aliases": {"alcf": {"beam": {"model": "beam-1.0-fp8", "url": "https://inference-api.alcf.anl.gov/resource_server/tara/api"},
+                         "muse": "muse-spark-bf16"}},
 }
 
 
@@ -113,6 +117,16 @@ def _argo_base(path):
     return url if urlsplit(url).hostname in ("127.0.0.1", "localhost") else None
 
 
+def argo_creds(cfg):
+    """(token, base URL) for argo-shim. Explicit config wins; then the settings file (re-read on change, so a rotated
+    token is picked up); then the environment. Nothing needs to live in Claude Code's own settings."""
+    tok = (cfg.get("argo_token") or cached_file(cfg["argo_settings"], _argo_token)
+           or os.environ.get("ARGO_SHIM_TOKEN"))
+    url = (cfg.get("argo_url") or os.environ.get("ARGO_SHIM_URL")
+           or cached_file(cfg["argo_settings"], _argo_base))
+    return tok, url
+
+
 def mag_token():
     return os.environ.get("AMSC_TOKEN")
 
@@ -153,10 +167,10 @@ def resolve(cfg, model):
             raise RouteError(401, "AMSC_TOKEN is not set in the router's environment (restart it after exporting)")
         return cfg["mag_url"], {"authorization": "Bearer " + tok}, True, base, tag
     if tag == "argo":
-        tok = cached_file(cfg["argo_settings"], _argo_token)
-        url = cfg["argo_url"] or cached_file(cfg["argo_settings"], _argo_base)
+        tok, url = argo_creds(cfg)
         if not tok or not url:
-            raise RouteError(502, "cannot read argo-shim token/base URL from %s" % cfg["argo_settings"])
+            raise RouteError(502, "no argo-shim token/URL: set argo_url and argo_token in config.json (or "
+                                  "ARGO_SHIM_URL / ARGO_SHIM_TOKEN), or point argo_settings at a file with them")
         return url, {"x-api-key": tok}, True, base, tag
     if tag == "asksage":
         return cfg["asksage_url"], {}, True, base, tag
@@ -169,7 +183,9 @@ def resolve(cfg, model):
     tok = alcf_token()
     if not tok:
         raise RouteError(401, "no ALCF token; run in your own terminal: alcf-tokens login inference")
-    return cfg["alcf_url"], {"authorization": "Bearer " + tok}, True, cfg["aliases"]["alcf"].get(base, base), tag
+    alias = cfg["aliases"]["alcf"].get(base, base)
+    url, model = (alias.get("url", cfg["alcf_url"]), alias["model"]) if isinstance(alias, dict) else (cfg["alcf_url"], alias)
+    return url, {"authorization": "Bearer " + tok}, True, model, tag
 
 
 BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result", "thinking", "redacted_thinking",
@@ -382,6 +398,14 @@ def cmd_init(cfg, quiet=False):
         "ANTHROPIC_CUSTOM_HEADERS": "x-router-key: " + read_key(),
         "ENABLE_TOOL_SEARCH": str(cfg["tool_search"]),
     }}
+    rows = []
+    for m in cfg.get("models") or []:
+        row = {"model": m} if isinstance(m, str) else dict(m)
+        if row.get("model"):
+            row.setdefault("label", row["model"])
+            rows.append(row)
+    if rows:
+        settings["modelPicker"] = {"options": rows}
     sp = os.path.join(DIR, "settings.json")
     fd = os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -406,12 +430,71 @@ def cmd_ensure(cfg):
     sys.exit("backend-switchboard failed to start; see %s/router.log" % DIR)
 
 
+def settings_conflicts(cfg):
+    """Claude Code settings that make the plain-Anthropic (subscription) route fail: left over from an Argo-only setup."""
+    cdir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    try:
+        with open(os.path.join(cdir, "settings.json")) as f:
+            user = json.load(f)
+    except (OSError, ValueError):
+        user = {}
+    env = dict(user.get("env", {}))
+    env.update({k: v for k, v in os.environ.items() if k == "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH"})
+    found = []
+    if str(env.get("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", "")).lower() in ("1", "true", "yes"):
+        found.append("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH is set, so Claude Code skips your Anthropic login")
+    if env.get("ANTHROPIC_BASE_URL"):
+        found.append("ANTHROPIC_BASE_URL in %s sends plain `claude` straight to %s, not through the switchboard"
+                     % (os.path.join(cdir, "settings.json"), env["ANTHROPIC_BASE_URL"]))
+    helper = user.get("apiKeyHelper")
+    words = shlex.split(helper) if isinstance(helper, str) and helper.strip() else []
+    argo_tok = argo_creds(cfg)[0]
+    if words and argo_tok and words[-1] == argo_tok:
+        found.append("apiKeyHelper in %s sends the argo-shim key on every request" % os.path.join(cdir, "settings.json"))
+    return found
+
+
 def cmd_run(cfg, args):
     cmd_init(cfg, quiet=True)  # keeps settings.json in sync with config.json (port)
+    problems = settings_conflicts(cfg)
+    if problems:
+        sys.stderr.write("backend-switchboard: warning: untagged models (your subscription) will fail:\n"
+                         + "".join("  - %s\n" % p for p in problems)
+                         + "  Move the Argo setup into ~/.backend-switchboard/config.json (argo_url, argo_token) and remove\n"
+                           "  these from Claude Code's settings.json. See README: \"Coming from an Argo-only setup\".\n")
     cmd_ensure(cfg)
     if shutil.which("claude") is None:
         sys.exit("claude not found on PATH; install Claude Code first")
     os.execvp("claude", ["claude", "--settings", os.path.join(DIR, "settings.json")] + args)
+
+
+def cmd_doctor(cfg):
+    """Print what is and is not set up, per backend, so first-time setup problems are visible before a session breaks."""
+    def row(ok, name, msg):
+        print("%-4s %-10s %s" % ("ok" if ok else "FIX", name, msg))
+    cdir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    print("Claude Code config dir: %s" % cdir)
+    row(not tls_broken(), "tls", "HTTPS context works" + (" (OPENSSL_CONF=%s)" % os.environ["OPENSSL_CONF"]
+                                                           if "OPENSSL_CONF" in os.environ else "")
+        if not tls_broken() else "Python's OpenSSL rejects the system openssl.cnf; restart via backend-switchboard "
+                                 "(sets OPENSSL_CONF=/dev/null) or export OPENSSL_CONF=/dev/null")
+    row(healthy(cfg["port"]), "router", "listening on 127.0.0.1:%d" % cfg["port"] if healthy(cfg["port"])
+        else "not running (`backend-switchboard ensure`)")
+    problems = settings_conflicts(cfg)
+    row(not problems, "settings", "no Argo-only leftovers in Claude Code settings" if not problems
+        else "; ".join(problems) + ' (README: "Coming from an Argo-only setup"; close running Claude sessions first)')
+    tok, url = argo_creds(cfg)
+    row(bool(tok and url), "argo", ("token and %s" % url) if tok and url else "set argo_url/argo_token in config.json (optional)")
+    row(bool(mag_token()), "mag", "AMSC_TOKEN set" if mag_token() else "export AMSC_TOKEN (optional)")
+    row(bool(os.environ.get("ALCF_INFERENCE_TOKEN") or shutil.which("alcf-tokens")), "alcf",
+        "token tools found" if shutil.which("alcf-tokens") or os.environ.get("ALCF_INFERENCE_TOKEN")
+        else "uv tool install alcf-ai alcf-tokens; alcf-tokens login inference (optional)")
+    ask = os.environ.get("ASKSAGE_API_KEY") or os.environ.get("ASKSAGE_PROXY_KEY")
+    row(bool(ask), "asksage", "API key set" if ask
+        else "export ASKSAGE_API_KEY in the shell that starts the router (optional)")
+    gh = any(os.environ.get(k) for k in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")) or shutil.which("gh")
+    row(bool(gh), "copilot", "gh or token env found" if gh else "gh auth login (optional)")
+    print("anthropic: no setup here; run /login inside Claude Code once. Optional rows are only needed for the backends you use.")
 
 
 def cmd_stop():
@@ -423,11 +506,23 @@ def cmd_stop():
         print("not running")
 
 
+def tls_broken():
+    """True if Python cannot build a default TLS context, probed in a fresh process (OpenSSL reports a bad config only
+    on the first use in a process). Seen when the system openssl.cnf has settings the bundled OpenSSL cannot initialize
+    (e.g. `seed=JITTER` with OpenSSL 3.5): every HTTPS route then fails with `SSLError ... (_ssl.c:3036)`."""
+    probe = "import ssl; ssl.create_default_context()"
+    return subprocess.call([sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0
+
+
 def main():
+    # OpenSSL reads its config when `ssl` is imported, so the only fix is to restart with a neutral config.
+    if "OPENSSL_CONF" not in os.environ and tls_broken():
+        os.environ["OPENSSL_CONF"] = os.devnull
+        os.execv(sys.executable, [sys.executable, "-m", "backend_switchboard"] + sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "run":  # everything after "run" belongs to claude
         return cmd_run(load_config(), sys.argv[2:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["init", "serve", "ensure", "stop"],
+    ap.add_argument("command", choices=["init", "serve", "ensure", "stop", "doctor"],
                     help="run [claude args...] is also accepted: starts the router if needed, then launches claude")
     cmd = ap.parse_args().command
     cfg = load_config()
@@ -442,6 +537,8 @@ def main():
             pass
     elif cmd == "ensure":
         cmd_ensure(cfg)
+    elif cmd == "doctor":
+        cmd_doctor(cfg)
     else:
         cmd_stop()
 

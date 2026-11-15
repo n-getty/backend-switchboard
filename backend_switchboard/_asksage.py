@@ -198,7 +198,7 @@ def handle(h, cfg, obj):
     q = to_query(obj)
     if h.path.split("?")[0].endswith("/count_tokens"):
         return send(200, json.dumps({"input_tokens": _tokens(q["message"]) + _tokens(q.get("tools", []))}).encode())
-    key = os.environ.get("ASKSAGE_API_KEY")
+    key = os.environ.get("ASKSAGE_API_KEY") or os.environ.get("ASKSAGE_PROXY_KEY")  # the latter: asksage-proxy users
     if not key:
         return fail(401, "authentication_error", "ASKSAGE_API_KEY is not set in the router's environment (restart it after exporting)")
     try:
