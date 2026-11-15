@@ -162,7 +162,7 @@ Optional `~/.backend-switchboard/config.json`; every key has a default:
 | `asksage_url` / `asksage_cert` | `https://api.asksage.anl.gov/server` / none | AskSage server and optional extra CA bundle |
 | `copilot_url` | `https://api.githubcopilot.com` | `@copilot` route |
 | `alcf_url` | ALCF Minerva `/api` | endpoint behind `@alcf` (Anthropic Messages API) |
-| `models` | none | extra rows for `/model`: names like `"beam@alcf"` or `{"model", "label", "description"}`; written as `modelPicker` in the generated settings (Claude Code 2.1.242+) |
+| `models` | one row per backend (Argo, MAG, ALCF, AskSage, Copilot); `[]` for none | extra rows for `/model`: names like `"beam@alcf"` or `{"model", "label", "description"}`; written as `modelPicker` in the generated settings (Claude Code 2.1.242+) |
 | `aliases` | `beam`, `muse` | short names per backend (`alcf`, `copilot`) |
 
 ## Security
