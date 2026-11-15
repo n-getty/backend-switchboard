@@ -45,7 +45,7 @@ backend-switchboard run -c           # anything after "run" is passed to claude
 Then inside Claude Code: `/model beam@alcf`, `/model claude-sonnet-5-5@argo`, `/model claude-sonnet-5-5` (back to your
 subscription). You can switch mid-conversation; the history is carried across backends.
 
-Other commands: `doctor` (checks each backend's setup and flags settings that will break your subscription), `init` (create the key and settings), `ensure` (start the router in the background), `stop`, `serve`
+Other commands: `migrate` (move an Argo-only Claude Code setup behind the switchboard), `doctor` (checks each backend's setup and flags settings that will break your subscription), `init` (create the key and settings), `ensure` (start the router in the background), `stop`, `serve`
 (foreground). State lives in `~/.backend-switchboard/` (override with `BACKEND_SWITCHBOARD_HOME`).
 
 You do not need a separate config directory or alias per backend: run `/login` once in your normal `~/.claude` and every
@@ -67,16 +67,20 @@ If your Claude Code was already pointed at argo-shim (`ANTHROPIC_BASE_URL`, an `
 from working through the switchboard: Claude Code skips your login and sends the shim key to Anthropic. `run` prints a
 warning when it sees this. One-time fix, so a single `~/.claude` serves every backend:
 
-**Close any running Claude Code sessions that use the Argo setup before step 2.** Claude Code re-reads
+**Close any running Claude Code sessions that use the Argo setup before migrating.** Claude Code re-reads
 `settings.json` while it runs, so removing `apiKeyHelper` under a live Argo session makes it fall back to your Anthropic
 login and fail midstream with "Login expired · Please run /login". Any backup of `settings.json` you make also contains
 the shim token; keep it mode 600 (or delete it).
 
-1. Put the shim details where only the router reads them, in `~/.backend-switchboard/config.json`:
-   `{"argo_url": "http://127.0.0.1:<port>/argoapi", "argo_token": "<shim token>"}` (or export `ARGO_SHIM_URL` and
-   `ARGO_SHIM_TOKEN` in the shell that starts the router).
-2. Remove `ANTHROPIC_BASE_URL`, `apiKeyHelper` and `CLAUDE_CODE_SKIP_ANTHROPIC_AUTH` from `~/.claude/settings.json`.
-3. Run `backend-switchboard doctor` to confirm, then `backend-switchboard run` and `/login` once to use your subscription.
+Run `backend-switchboard migrate`. It saves the shim URL and token to `~/.backend-switchboard/config.json` (mode 600),
+backs up `settings.json` (mode 600, delete it when happy), and removes `ANTHROPIC_BASE_URL`, `apiKeyHelper` and
+`CLAUDE_CODE_SKIP_ANTHROPIC_AUTH` from it, leaving your other settings alone. If `CLAUDE_CODE_SKIP_ANTHROPIC_AUTH` is
+exported in your shell profile, `migrate` can't remove that; it tells you what to unset. Then run
+`backend-switchboard doctor`, `backend-switchboard run` and `/login` once.
+
+By hand, the same thing: put `{"argo_url": "http://127.0.0.1:<port>/argoapi", "argo_token": "<shim token>"}` in
+`config.json` (or export `ARGO_SHIM_URL` and `ARGO_SHIM_TOKEN` where the router starts), then delete those three
+settings.
 
 You no longer need a second config directory or a per-backend alias.
 
