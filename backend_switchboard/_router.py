@@ -454,14 +454,85 @@ def settings_conflicts(cfg):
     return found
 
 
+def _write_json_600(path, data):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def cmd_migrate(cfg, yes=False):
+    """Move an Argo-only Claude Code setup behind the switchboard: shim URL/token into config.json, and remove
+    ANTHROPIC_BASE_URL, apiKeyHelper and CLAUDE_CODE_SKIP_ANTHROPIC_AUTH from Claude Code's settings.json."""
+    cdir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    sp = os.path.join(cdir, "settings.json")
+    try:
+        with open(sp) as f:
+            user = json.load(f)
+    except (OSError, ValueError):
+        user = {}
+    tok, url = argo_creds(cfg)  # read before anything is removed
+    env = user.get("env", {})
+    helper = user.get("apiKeyHelper")
+    words = shlex.split(helper) if isinstance(helper, str) and helper.strip() else []
+    remove = []
+    if str(env.get("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", "")).lower() in ("1", "true", "yes"):
+        remove.append("env.CLAUDE_CODE_SKIP_ANTHROPIC_AUTH")
+    if env.get("ANTHROPIC_BASE_URL") and urlsplit(env["ANTHROPIC_BASE_URL"]).hostname in ("127.0.0.1", "localhost"):
+        remove.append("env.ANTHROPIC_BASE_URL")
+    if words and tok and words[-1] == tok:
+        remove.append("apiKeyHelper")
+    shell_skip = str(os.environ.get("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", "")).lower() in ("1", "true", "yes")
+    if not remove and not shell_skip:
+        print("nothing to migrate: %s has no Argo-only settings" % sp)
+        return
+    print("Claude Code config dir: %s" % cdir)
+    if remove:
+        print("will remove from %s: %s" % (sp, ", ".join(remove)))
+        print("will save the Argo URL and token to %s (mode 600)" % os.path.join(DIR, "config.json"))
+        print("will back up settings.json to %s.bak-switchboard (mode 600; it contains the token, delete it when happy)" % sp)
+    print("!! Close every running Claude Code session that uses this setup first: they re-read settings.json and the Argo\n"
+          "   ones will fail midstream with 'Login expired'.")
+    if remove and not yes and (input("Continue? [y/N] ").strip().lower() != "y"):
+        return print("aborted, nothing changed")
+    if remove:
+        if tok and url:
+            os.makedirs(DIR, mode=0o700, exist_ok=True)
+            cp = os.path.join(DIR, "config.json")
+            try:
+                with open(cp) as f:
+                    conf = json.load(f)
+            except (OSError, ValueError):
+                conf = {}
+            conf.setdefault("argo_url", url)
+            conf.setdefault("argo_token", tok)
+            _write_json_600(cp, conf)
+        else:
+            print("warning: no Argo token/URL found to save; @argo will need argo_url/argo_token in config.json")
+        _write_json_600(sp + ".bak-switchboard", user)
+        user.pop("apiKeyHelper", None) if "apiKeyHelper" in remove else None
+        for k in ("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", "ANTHROPIC_BASE_URL"):
+            if "env." + k in remove:
+                env.pop(k, None)
+        if "env" in user and not user["env"]:
+            del user["env"]
+        _write_json_600(sp, user)
+        print("done: settings.json cleaned. Start Claude with `backend-switchboard run` and /login once.")
+    if shell_skip:
+        print("!! CLAUDE_CODE_SKIP_ANTHROPIC_AUTH is also exported in your shell, which this tool cannot change.\n"
+              "   Run `unset CLAUDE_CODE_SKIP_ANTHROPIC_AUTH` and delete the export from ~/.bashrc / ~/.zshrc / ~/.profile\n"
+              "   (find it with: grep -n CLAUDE_CODE_SKIP_ANTHROPIC_AUTH ~/.bashrc ~/.zshrc ~/.profile ~/.bash_profile).")
+
+
 def cmd_run(cfg, args):
     cmd_init(cfg, quiet=True)  # keeps settings.json in sync with config.json (port)
     problems = settings_conflicts(cfg)
     if problems:
         sys.stderr.write("backend-switchboard: warning: untagged models (your subscription) will fail:\n"
                          + "".join("  - %s\n" % p for p in problems)
-                         + "  Move the Argo setup into ~/.backend-switchboard/config.json (argo_url, argo_token) and remove\n"
-                           "  these from Claude Code's settings.json. See README: \"Coming from an Argo-only setup\".\n")
+                         + "  Fix: close running Claude Code sessions, then run `backend-switchboard migrate`.\n")
     cmd_ensure(cfg)
     if shutil.which("claude") is None:
         sys.exit("claude not found on PATH; install Claude Code first")
@@ -482,7 +553,7 @@ def cmd_doctor(cfg):
         else "not running (`backend-switchboard ensure`)")
     problems = settings_conflicts(cfg)
     row(not problems, "settings", "no Argo-only leftovers in Claude Code settings" if not problems
-        else "; ".join(problems) + ' (README: "Coming from an Argo-only setup"; close running Claude sessions first)')
+        else "; ".join(problems) + "  -> close running Claude sessions, then run: backend-switchboard migrate")
     tok, url = argo_creds(cfg)
     row(bool(tok and url), "argo", ("token and %s" % url) if tok and url else "set argo_url/argo_token in config.json (optional)")
     row(bool(mag_token()), "mag", "AMSC_TOKEN set" if mag_token() else "export AMSC_TOKEN (optional)")
@@ -522,9 +593,11 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "run":  # everything after "run" belongs to claude
         return cmd_run(load_config(), sys.argv[2:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["init", "serve", "ensure", "stop", "doctor"],
+    ap.add_argument("command", choices=["init", "serve", "ensure", "stop", "doctor", "migrate"],
                     help="run [claude args...] is also accepted: starts the router if needed, then launches claude")
-    cmd = ap.parse_args().command
+    ap.add_argument("--yes", "-y", action="store_true", help="migrate: do not ask for confirmation")
+    ns = ap.parse_args()
+    cmd = ns.command
     cfg = load_config()
     if cmd == "init":
         cmd_init(cfg)
@@ -539,6 +612,8 @@ def main():
         cmd_ensure(cfg)
     elif cmd == "doctor":
         cmd_doctor(cfg)
+    elif cmd == "migrate":
+        cmd_migrate(cfg, ns.yes)
     else:
         cmd_stop()
 

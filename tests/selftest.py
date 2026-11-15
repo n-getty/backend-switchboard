@@ -249,6 +249,24 @@ check("settings_conflicts: unrelated apiKeyHelper is left alone", cr.settings_co
 json.dump({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:20098/argoapi"}}, open(os.path.join(cdir, "settings.json"), "w"))
 check("settings_conflicts: leftover ANTHROPIC_BASE_URL reported", len(cr.settings_conflicts(cfg0)) == 1)
 del os.environ["CLAUDE_CONFIG_DIR"]
+# migrate: the full Argo-only setup is moved into config.json and removed from settings.json, other keys survive
+os.environ["CLAUDE_CONFIG_DIR"] = cdir
+os.environ.pop("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", None)
+sj = os.path.join(cdir, "settings.json")
+json.dump({"apiKeyHelper": "echo SHIMTOK", "theme": "dark",
+           "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:20098/argoapi", "CLAUDE_CODE_SKIP_ANTHROPIC_AUTH": "1", "KEEP": "1"}},
+          open(sj, "w"))
+cfgx = dict(cr.load_config(), argo_token=None, argo_url=None, argo_settings=sj)
+cr.cmd_migrate(cfgx, yes=True)
+after, conf = json.load(open(sj)), json.load(open(os.path.join(cr.DIR, "config.json")))
+check("migrate: Argo keys removed, others kept", after == {"theme": "dark", "env": {"KEEP": "1"}})
+check("migrate: shim url/token moved to config.json", conf.get("argo_token") == "SHIMTOK" and conf.get("argo_url", "").endswith(":20098/argoapi"))
+check("migrate: backup and config.json are mode 600", all(oct(os.stat(f).st_mode & 0o777) == "0o600" for f in
+      (sj + ".bak-switchboard", os.path.join(cr.DIR, "config.json"))))
+check("migrate: settings clean afterwards", cr.settings_conflicts(cr.load_config()) == [])
+cr.cmd_migrate(cr.load_config(), yes=True)  # second run is a no-op
+check("migrate: idempotent", json.load(open(sj)) == after)
+del os.environ["CLAUDE_CONFIG_DIR"]
 cfgm = dict(cr.load_config(), models=["beam@alcf", {"model": "x@argo", "label": "X"}, {"label": "no model"}])
 cr.cmd_init(cfgm, quiet=True)
 opts = json.load(open(os.path.join(cr.DIR, "settings.json")))["modelPicker"]["options"]
