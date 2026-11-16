@@ -242,6 +242,8 @@ check("argo_creds: config.json beats env",
       cr.argo_creds(dict(none_cfg, argo_token="CFGTOK", argo_url="http://127.0.0.1:2/argoapi"))
       == ("CFGTOK", "http://127.0.0.1:2/argoapi"))
 check("argo_creds: settings file beats env token", cr.argo_creds(cr.load_config())[0] == "ARGOTOKEN")
+check("argo_creds: restarted shim's settings token beats a stale saved one",
+      cr.argo_creds(dict(cr.load_config(), argo_token="STALE"))[0] == "ARGOTOKEN")
 del os.environ["ARGO_SHIM_TOKEN"], os.environ["ARGO_SHIM_URL"]
 
 # Argo-only Claude Code settings are detected (and an unrelated apiKeyHelper is not)
@@ -257,6 +259,10 @@ json.dump({"apiKeyHelper": "echo sk-ant-real"}, open(os.path.join(cdir, "setting
 check("settings_conflicts: unrelated apiKeyHelper is left alone", cr.settings_conflicts(cfg0) == [])
 json.dump({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:20098/argoapi"}}, open(os.path.join(cdir, "settings.json"), "w"))
 check("settings_conflicts: leftover ANTHROPIC_BASE_URL reported", len(cr.settings_conflicts(cfg0)) == 1)
+check("settings_conflicts: via_run ignores base URL (--settings overrides it)", cr.settings_conflicts(cfg0, via_run=True) == [])
+json.dump({"apiKeyHelper": "echo ARGOTOKEN"}, open(os.path.join(cdir, "settings.json"), "w"))
+check("settings_conflicts: via_run ignores argo apiKeyHelper (blanked in router settings)", cr.settings_conflicts(cfg0, via_run=True) == [])
+check("init: router settings blank apiKeyHelper", (cr.cmd_init(cfg0, quiet=True), json.load(open(os.path.join(cr.DIR, "settings.json")))["apiKeyHelper"])[1] == "")
 del os.environ["CLAUDE_CONFIG_DIR"]
 # a running router sees argo creds written to config.json after it started
 cdir2 = os.path.join(tmp, "cd2"); os.makedirs(cdir2)
