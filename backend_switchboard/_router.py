@@ -133,14 +133,15 @@ def _config_argo(path):
 
 
 def argo_creds(cfg):
-    """(token, base URL) for argo-shim. Explicit config wins; then the settings file (re-read on change, so a rotated
-    token is picked up); then the environment. Nothing needs to live in Claude Code's own settings."""
+    """(token, base URL) for argo-shim. argo-shim rewrites its token and URL into Claude Code's settings.json on every
+    restart, so that live file wins (re-read on change); config.json / cfg / the environment are the fallback for setups
+    without it (e.g. after `migrate` removed them). A saved copy must never shadow a restarted shim's fresh token."""
     # config.json is re-read on change, so `migrate` (or an edit) works without restarting a running router
     live_tok, live_url = cached_file(os.path.join(DIR, "config.json"), _config_argo) or (None, None)
-    tok = (cfg.get("argo_token") or live_tok or cached_file(cfg["argo_settings"], _argo_token)
+    tok = (cached_file(cfg["argo_settings"], _argo_token) or cfg.get("argo_token") or live_tok
            or os.environ.get("ARGO_SHIM_TOKEN"))
-    url = (cfg.get("argo_url") or live_url or os.environ.get("ARGO_SHIM_URL")
-           or cached_file(cfg["argo_settings"], _argo_base))
+    url = (cached_file(cfg["argo_settings"], _argo_base) or cfg.get("argo_url") or live_url
+           or os.environ.get("ARGO_SHIM_URL"))
     return tok, url
 
 
@@ -418,7 +419,9 @@ def cmd_init(cfg, quiet=False):
         fd = os.open(kp, os.O_WRONLY | os.O_CREAT, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(secrets.token_urlsafe(32) + "\n")
-    settings = {"env": {
+    # empty apiKeyHelper: `--settings` outranks user settings, so this stops a re-added argo-shim helper from replacing
+    # the Anthropic login for untagged models
+    settings = {"apiKeyHelper": "", "env": {
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % cfg["port"],
         "ANTHROPIC_CUSTOM_HEADERS": "x-router-key: " + read_key(),
         "ENABLE_TOOL_SEARCH": str(cfg["tool_search"]),
@@ -455,8 +458,10 @@ def cmd_ensure(cfg):
     sys.exit("backend-switchboard failed to start; see %s/router.log" % DIR)
 
 
-def settings_conflicts(cfg):
-    """Claude Code settings that make the plain-Anthropic (subscription) route fail: left over from an Argo-only setup."""
+def settings_conflicts(cfg, via_run=False):
+    """Claude Code settings that make the plain-Anthropic (subscription) route fail: left over from an Argo-only setup.
+    `run` launches claude with --settings, which outranks user settings for ANTHROPIC_BASE_URL and apiKeyHelper, so
+    via_run skips those; they still break plain `claude`."""
     cdir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
     try:
         with open(os.path.join(cdir, "settings.json")) as f:
@@ -468,13 +473,13 @@ def settings_conflicts(cfg):
     found = []
     if str(env.get("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH", "")).lower() in ("1", "true", "yes"):
         found.append("CLAUDE_CODE_SKIP_ANTHROPIC_AUTH is set, so Claude Code skips your Anthropic login")
-    if env.get("ANTHROPIC_BASE_URL"):
+    if env.get("ANTHROPIC_BASE_URL") and not via_run:
         found.append("ANTHROPIC_BASE_URL in %s sends plain `claude` straight to %s, not through the switchboard"
                      % (os.path.join(cdir, "settings.json"), env["ANTHROPIC_BASE_URL"]))
     helper = user.get("apiKeyHelper")
     words = shlex.split(helper) if isinstance(helper, str) and helper.strip() else []
     argo_tok = argo_creds(cfg)[0]
-    if words and argo_tok and words[-1] == argo_tok:
+    if words and argo_tok and words[-1] == argo_tok and not via_run:
         found.append("apiKeyHelper in %s sends the argo-shim key on every request" % os.path.join(cdir, "settings.json"))
     return found
 
@@ -554,7 +559,7 @@ def cmd_migrate(cfg, yes=False):
 
 def cmd_run(cfg, args):
     cmd_init(cfg, quiet=True)  # keeps settings.json in sync with config.json (port)
-    problems = settings_conflicts(cfg)
+    problems = settings_conflicts(cfg, via_run=True)
     if problems:
         sys.stderr.write("backend-switchboard: warning: untagged models (your subscription) will fail:\n"
                          + "".join("  - %s\n" % p for p in problems)
