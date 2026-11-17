@@ -238,6 +238,28 @@ def strip_client_extensions(obj):
     return changed
 
 
+def strip_foreign_thinking(obj):
+    """History from another backend (e.g. Argo) can hold thinking blocks with empty text or no signature, which
+    Anthropic rejects: "each thinking block must contain thinking". Drop those blocks, then any message left empty.
+    Returns True if anything changed."""
+    msgs = obj.get("messages", [])
+    changed = False
+    for msg in msgs:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        kept = [b for b in content if not (isinstance(b, dict) and b.get("type") == "thinking"
+                                           and not (b.get("thinking") and b.get("signature")))]
+        if len(kept) != len(content):
+            msg["content"] = kept
+            changed = True
+    live = [m for m in msgs if not (isinstance(m, dict) and m.get("content") == [])]
+    if len(live) != len(msgs):
+        obj["messages"] = live
+        changed = True
+    return changed
+
+
 def flatten_tool_search(obj):
     """Make Claude Code's deferred-tool search safe for backends that lack Anthropic's tool_reference blocks.
 
@@ -327,6 +349,8 @@ class Handler(BaseHTTPRequestHandler):
                 if backend != "anthropic":
                     dirty = flatten_tool_search(obj) or dirty
                     dirty = strip_client_extensions(obj) or dirty
+                else:
+                    dirty = strip_foreign_thinking(obj) or dirty
                 if dirty:
                     body = json.dumps(obj).encode()
             if backend == "asksage":

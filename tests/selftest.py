@@ -307,6 +307,14 @@ cr.cmd_init(cfgm, quiet=True)
 opts = json.load(open(os.path.join(cr.DIR, "settings.json")))["modelPicker"]["options"]
 check("init: models become modelPicker rows", opts == [{"model": "beam@alcf", "label": "beam@alcf"}, {"model": "x@argo", "label": "X"}])
 
+o = {"messages": [{"role": "user", "content": "hi"},
+                  {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "s"}]},
+                  {"role": "assistant", "content": [{"type": "thinking", "thinking": "x", "signature": ""}, {"type": "text", "text": "a"}]},
+                  {"role": "assistant", "content": [{"type": "thinking", "thinking": "ok", "signature": "sig"}, {"type": "text", "text": "b"}]}]}
+check("strip_foreign_thinking: drops empty/unsigned blocks and emptied messages", cr.strip_foreign_thinking(o)
+      and [m["content"] if isinstance(m["content"], str) else [b["type"] for b in m["content"]] for m in o["messages"]]
+      == ["hi", ["text"], ["thinking", "text"]])
+
 print("\n%d failure(s)" % len(fails))
 sys.stdout.flush()
 sys.stderr.flush()
